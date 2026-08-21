@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The panel layout a fresh session starts with.
+
+  Replaces the file xfce4-panel ships, for two reasons.
+
+  1. Its plugin-19 is a launcher for xfce4-web-browser.desktop, which runs
+     `exo-open  - launch WebBrowser`. This image installs no browser and no
+     xdg-open, so that button is dead: it sits on the dock looking like a
+     feature and does nothing when clicked. Verified  -  there is no
+     x-www-browser, firefox, chromium or xdg-open in the image. A dead control
+     is worse than an absent one.
+
+  2. The stock layout is a menu bar at the top plus a floating dock at the
+     bottom. One bar at the top is closer to what a GNOME user expects, and it
+     gives back the strip of screen the dock was using  -  which matters more
+     here than on a laptop, because the desktop is only as tall as a browser
+     window with browser chrome above it.
+
+  So: one bar, full width, at the top. Applications on the left, the clock
+  centred the way GNOME centres it, status tray and a log-out button on the
+  right. Nothing here is a launcher, so nothing here can be dead.
+
+  This is a DEFAULT: xfce4-panel copies it into the user's own configuration on
+  first launch, and anything they rearrange afterwards persists in
+  $HOME/cirrus-desktop/config.
+-->
+<channel name="xfce4-panel" version="1.0">
+  <property name="configver" type="int" value="2"/>
+  <property name="panels" type="array">
+    <value type="int" value="1"/>
+    <property name="dark-mode" type="bool" value="true"/>
+    <property name="panel-1" type="empty">
+      <!-- p=6 is the top edge, x/y ignored for a full-width bar. -->
+      <property name="position" type="string" value="p=6;x=0;y=0"/>
+      <property name="length" type="uint" value="100"/>
+      <property name="position-locked" type="bool" value="true"/>
+      <property name="size" type="uint" value="30"/>
+      <property name="icon-size" type="uint" value="16"/>
+      <property name="plugin-ids" type="array">
+        <value type="int" value="1"/>
+        <value type="int" value="2"/>
+        <value type="int" value="3"/>
+        <value type="int" value="4"/>
+        <value type="int" value="5"/>
+        <value type="int" value="6"/>
+      </property>
+    </property>
+  </property>
+  <property name="plugins" type="empty">
+    <property name="plugin-1" type="string" value="applicationsmenu">
+      <property name="show-button-title" type="bool" value="true"/>
+      <property name="show-menu-icons" type="bool" value="true"/>
+    </property>
+    <!-- Expanding separators either side of the clock are how the panel centres
+         a plugin; there is no "centre" attribute. -->
+    <property name="plugin-2" type="string" value="separator">
+      <property name="expand" type="bool" value="true"/>
+      <property name="style" type="uint" value="0"/>
+    </property>
+    <property name="plugin-3" type="string" value="clock">
+      <property name="mode" type="uint" value="2"/>
+      <property name="digital-time-format" type="string" value="%a %e %b  %H:%M"/>
+    </property>
+    <property name="plugin-4" type="string" value="separator">
+      <property name="expand" type="bool" value="true"/>
+      <property name="style" type="uint" value="0"/>
+    </property>
+    <property name="plugin-5" type="string" value="systray">
+      <property name="square-icons" type="bool" value="true"/>
+    </property>
+    <!--
+      appearance=1 is the session menu (a name you click), not appearance=0's
+      bare icon button - which rendered as an unthemed green square, because the
+      action icon it wants is not in the Yaru chain. A named menu in the top
+      right corner is also closer to GNOME's status area. The name it shows is
+      the GECOS field of the passwd entry nss_wrapper builds, which entrypoint.sh
+      sets to the account name.
+    -->
+    <property name="plugin-6" type="string" value="actions">
+      <property name="appearance" type="int" value="1"/>
+      <property name="items" type="array">
+        <value type="string" value="+logout-dialog"/>
+        <value type="string" value="-separator"/>
+        <value type="string" value="-logout"/>
+      </property>
+    </property>
+  </property>
+</channel>

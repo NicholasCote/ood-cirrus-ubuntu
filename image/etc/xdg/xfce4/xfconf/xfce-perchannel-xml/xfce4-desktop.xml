@@ -1,0 +1,99 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The desktop backdrop.
+
+  A solid colour, not an image, and this is a transport decision rather than a
+  minimalist one. KasmVNC encodes changed screen regions; a full-screen photo is
+  a large, high-entropy region that has to be re-encoded on every full-frame
+  update, and it is behind a websocket through the OnDemand proxy. A flat colour
+  costs almost nothing to send and stays sharp at any browser window size, while
+  a photograph scaled to an arbitrary viewport is where a lossy encoder looks
+  worst.
+
+  Set `image-style` to 5 and point `last-image` at something under
+  /usr/share/backgrounds if a picture is wanted; xfdesktop ships xfce-blue.jpg,
+  and `ubuntu-wallpapers` would add Ubuntu's own set.
+
+  The colour is Yaru's dark background so the desktop, the panel and the window
+  frames are the same family. color-style 0 = solid.
+
+  Desktop icons are left on  -  they are how a user reaches
+  $HOME/cirrus-desktop/Desktop, which is the one XDG user directory this app
+  creates.
+-->
+<channel name="xfce4-desktop" version="1.0">
+  <property name="backdrop" type="empty">
+    <property name="screen0" type="empty">
+      <!--
+        monitorVNC-0, and the name is not a guess. xfdesktop keys its backdrop
+        properties on the RandR output name, and Xkasmvnc calls its output
+        VNC-0. Asked of a live session:
+          $ xfconf-query -c xfce4-desktop -l | grep backdrop
+          /backdrop/screen0/monitorVNC-0/workspace0/color-style
+          /backdrop/screen0/monitorVNC-0/workspace0/image-style
+          /backdrop/screen0/monitorVNC-0/workspace0/last-image
+        The first attempt here used "monitorscreen", which is the legacy
+        fallback name, and xfdesktop ignored it entirely - the desktop kept
+        xfdesktop's own built-in blue. Both are set below: VNC-0 for this X
+        server, monitorscreen so that an X server naming its output anything
+        else still gets the intended colour rather than the default.
+
+        A second monitor would be VNC-1 and is not covered; right-clicking the
+        desktop sets it.
+      -->
+      <property name="monitorVNC-0" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="color-style" type="int" value="0"/>
+          <property name="image-style" type="int" value="0"/>
+          <property name="rgba1" type="array">
+            <value type="double" value="0.13"/>
+            <value type="double" value="0.12"/>
+            <value type="double" value="0.14"/>
+            <value type="double" value="1.0"/>
+          </property>
+        </property>
+        <property name="workspace1" type="empty">
+          <property name="color-style" type="int" value="0"/>
+          <property name="image-style" type="int" value="0"/>
+          <property name="rgba1" type="array">
+            <value type="double" value="0.13"/>
+            <value type="double" value="0.12"/>
+            <value type="double" value="0.14"/>
+            <value type="double" value="1.0"/>
+          </property>
+        </property>
+      </property>
+      <property name="monitorscreen" type="empty">
+        <property name="workspace0" type="empty">
+          <property name="color-style" type="int" value="0"/>
+          <property name="image-style" type="int" value="0"/>
+          <property name="rgba1" type="array">
+            <value type="double" value="0.13"/>
+            <value type="double" value="0.12"/>
+            <value type="double" value="0.14"/>
+            <value type="double" value="1.0"/>
+          </property>
+        </property>
+        <property name="workspace1" type="empty">
+          <property name="color-style" type="int" value="0"/>
+          <property name="image-style" type="int" value="0"/>
+          <property name="rgba1" type="array">
+            <value type="double" value="0.13"/>
+            <value type="double" value="0.12"/>
+            <value type="double" value="0.14"/>
+            <value type="double" value="1.0"/>
+          </property>
+        </property>
+      </property>
+    </property>
+  </property>
+  <property name="desktop-icons" type="empty">
+    <property name="style" type="int" value="2"/>
+    <property name="file-icons" type="empty">
+      <property name="show-filesystem" type="bool" value="false"/>
+      <property name="show-home" type="bool" value="true"/>
+      <property name="show-trash" type="bool" value="false"/>
+      <property name="show-removable" type="bool" value="false"/>
+    </property>
+  </property>
+</channel>

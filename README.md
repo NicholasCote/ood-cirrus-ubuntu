@@ -477,7 +477,7 @@ podman build -t localhost/cirrus-desktop:dev -f image/Dockerfile image
 image/test/acceptance.sh
 ```
 
-Last run, 35 checks, all passing:
+Last run, 42 checks, all passing:
 
 ```
 == 1. arbitrary uid, runtime-synthesised numeric passwd entry ==
@@ -525,7 +525,15 @@ Last run, 35 checks, all passing:
   ok   with no proxy prefix the document is served directly, not redirected
   ok   a session with a client attached survives past its idle timeout
   ok   an idle session ends itself and exits 0 (so OnFailure does not restart it)
-== 10. versions recorded in the image ==
+== 10. the appearance defaults point at things that exist ==
+  ok   GTK theme 'Yaru-dark' has a gtk-3.0 directory
+  ok   window manager theme 'Yaru-dark' has an xfwm4 directory
+  ok   icon theme 'Yaru-dark' is installed
+  ok   cursor theme 'Yaru' ships cursors
+  ok   every icon theme 'Yaru-dark' inherits from is installed
+  ok   interface font 'Ubuntu' is installed
+  ok   no launcher on the default panel points at a missing program
+== 11. versions recorded in the image ==
   ok   desktop-versions --check agrees with the record
 ```
 
@@ -569,12 +577,148 @@ git            2.43.0
 record, and the acceptance test runs it. A base-image rebuild can change every
 one of these while the Dockerfile stays byte-identical.
 
+## Why it looks the way it does
+
+The first working session looked *broken* rather than minimal: stock GTK icons, a
+grey square where "File System" should have had an icon, raw grey window
+titlebars, and a floating dock. That was not the minimal package set showing
+through — it was a dangling configuration reference, and it is worth writing
+down because nothing failed and nothing was logged.
+
+`xfce4-settings` ships `/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xsettings.xml`,
+which sets:
+
+```xml
+<property name="ThemeName"     type="string" value="Greybird"/>
+<property name="IconThemeName" type="string" value="elementary-xfce-dark"/>
+```
+
+Both `greybird-gtk-theme` and `elementary-xfce-icon-theme` are *Recommends* of
+the XFCE packages, and this image is built with `--no-install-recommends`. So
+XFCE asked for a theme and an icon set that were not in the image, GTK silently
+fell back to its built-in Adwaita with no icon theme at all, and the desktop came
+up looking like a fault. A session that renders is not a session that renders
+*right*, and the acceptance suite had nothing to say about it.
+
+### GNOME Shell is not an option, and that was tested
+
+The obvious answer to "make it look like GNOME" is to run GNOME. It does not
+work here, for two independent reasons, both measured by building it into a
+probe image and starting it under this same X server:
+
+```
+Gjs-CRITICAL **: JS ERROR: Gio.IOErrorEnum: Could not connect: No such file or directory
+  LoginManagerSystemd@resource:///org/gnome/shell/misc/loginManager.js:96:9
+  getLoginManager@resource:///org/gnome/shell/misc/loginManager.js:84:29
+
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+```
+
+GNOME Shell resolves its login manager through **systemd-logind** and exits when
+it cannot reach it. logind needs systemd as PID 1, which an unprivileged OOD pod
+does not have. Separately, Xkasmvnc exposes no DRI3, so mutter gets no
+accelerated rendering — GNOME Shell is a GL compositor, and this pod has
+llvmpipe at best.
+
+### So: XFCE wearing Ubuntu's GNOME theme
+
+`yaru-theme-gtk` and `yaru-theme-icon` — Ubuntu's own theme, so this is the look
+of an Ubuntu GNOME desktop rather than an approximation. Yaru is the pick for one
+concrete reason beyond that: it is the only GTK theme in the archive that also
+ships an **xfwm4** variant, verified from the package contents:
+
+```
+themes/Yaru-dark/gtk-2.0  gtk-3.0  gtk-4.0  metacity-1  xfwm4
+```
+
+xfwm4 draws window borders from its own theme directory, and most GTK themes
+ship none — so without that the widgets would be themed and the frames around
+them would still be the 1990s `Default`.
+
+Delivered as **system-wide xfconf defaults**, not a runtime seeding step: xfconf
+reads `/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/` through `XDG_CONFIG_DIRS` and
+copies the values into the user's own channel files on first launch. So anything
+changed in *Settings → Appearance* wins from then on, and persists in
+`$HOME/cirrus-desktop/config` like the rest of their desktop state. No code
+runs, and there is nothing to un-seed.
+
+Two of the four files are about this **transport** rather than taste:
+
+* **Grayscale antialiasing, not subpixel** (`Xft/RGBA = none`). Subpixel
+  rendering colours the edge of every glyph on the assumption that it lands on a
+  physical LCD stripe in that order. This framebuffer is JPEG/WebP encoded by
+  KasmVNC and decoded in a browser at whatever scale the window happens to be:
+  the fringes survive as artefacts *and* cost bitrate, because chroma detail is
+  exactly what a lossy encoder is trying to discard.
+* **A flat desktop colour, not a photograph.** A full-screen wallpaper is a
+  large high-entropy region to re-encode on every full-frame update, and it looks
+  worst precisely when scaled to an arbitrary viewport. Set `image-style` to 5
+  and point `last-image` somewhere under `/usr/share/backgrounds` if a picture is
+  wanted.
+
+Two smaller things that cost a measurement each:
+
+* The backdrop is keyed on the **RandR output name**, and Xkasmvnc calls its
+  output `VNC-0`. The first attempt used `monitorscreen`, the legacy fallback
+  name, and xfdesktop ignored it entirely — the desktop kept xfdesktop's own
+  built-in blue. Asked of a live session:
+
+  ```
+  $ xfconf-query -c xfce4-desktop -l | grep backdrop
+  /backdrop/screen0/monitorVNC-0/workspace0/color-style
+  ```
+
+* `yaru-theme-icon` declares **no dependencies at all**, and every Yaru variant
+  reads `Inherits=Yaru,Humanity,hicolor`. Humanity was in the image only as an
+  accident of something else's dependencies — which is the same dangling
+  reference one level down, so every link is now named explicitly and asserted.
+
+### The panel
+
+One bar at the top: Applications on the left, the clock centred the way GNOME
+centres it, status menu on the right. The stock XFCE layout is a menu bar plus a
+floating bottom dock, and it was replaced for two reasons — one cosmetic, one a
+real defect:
+
+* its `plugin-19` is a launcher for `xfce4-web-browser.desktop`, which runs
+  `exo-open --launch WebBrowser`. This image has no browser and no `xdg-open`, so
+  that button sat on the dock looking like a feature and did nothing. **A dead
+  control is worse than an absent one.**
+* one top bar gives back the strip the dock was using, which matters more here
+  than on a laptop: the desktop is only as tall as a browser window with browser
+  chrome above it.
+
+Nothing on the new panel is a launcher, so nothing on it can be dead — and the
+acceptance suite now checks that claim for whatever layout is shipped.
+
+### Light or dark
+
+`Yaru-dark` is the default. For the light variant, change the four names in
+`image/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/`
+(`xsettings.xml`: `ThemeName`, `IconThemeName`; `xfwm4.xml`: `theme`) from
+`Yaru-dark` to `Yaru`, and lighten the `rgba1` values in `xfce4-desktop.xml`. The
+panel stays dark either way, which is how Ubuntu GNOME looks. A user can also
+just switch it in *Settings → Appearance* for their own sessions.
+
+### The regression guard
+
+The check that would have caught all of this is now section 10 of the acceptance
+suite: **every name the appearance defaults mention must resolve to something in
+the image** — the GTK theme's `gtk-3.0/`, the window manager theme's `xfwm4/`,
+the icon theme's `index.theme`, every theme it inherits from, the cursor theme's
+`cursors/`, the interface font family, and every `Exec=` behind every launcher on
+the default panel.
+
 ## What is installed, and what is not
 
 XFCE core — session, window manager, panel, desktop, settings — plus
 xfce4-terminal, Thunar, Mousepad and xfce4-appfinder. Then `git`, `less`,
 `nano`, `curl`, `openssh-client` for the terminal, and `python3` for the gate.
-Roughly 630 MB.
+Appearance: `yaru-theme-gtk`, `yaru-theme-icon`, `humanity-icon-theme`,
+`adwaita-icon-theme`, `fonts-ubuntu`, `fonts-dejavu-core`. Roughly 780 MB — the
+theme and font packages account for about 145 MB of that, which is the price of
+not looking broken.
 
 That is the deliberate scope: the reason to open a desktop here is to look at
 and manipulate files on GLADE, and everything beyond that a user brings from
@@ -594,7 +738,12 @@ Notable omissions:
   renders in software rather than crashing. KasmVNC reports
   `Hardware video encoding acceleration capability: unavailable`, which is
   correct and expected.
-* **No PulseAudio.** There is no audio path through the proxy.
+* **No PulseAudio.** There is no audio path through the proxy — which is also
+  why `EnableEventSounds` is off in the appearance defaults rather than left at
+  its default: an event sound nobody can hear is still a file read and a decode.
+* **No GNOME Shell, MATE or Cinnamon.** See above for GNOME Shell, which was
+  tested and cannot work here. MATE and Cinnamon were not tried; XFCE is the one
+  that is already proven against every other constraint in this app.
 
 To add software, add to the `apt-get install` in `image/Dockerfile`, rebuild,
 and re-run `image/test/acceptance.sh` — the home-isolation checks are exactly

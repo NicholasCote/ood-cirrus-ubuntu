@@ -488,7 +488,52 @@ else
     bad "idle session state=${state} exit=${rc}, expected exited/0"
 fi
 
-head_ "10. versions recorded in the image"
+head_ "10. the appearance defaults point at things that exist"
+# This is the check that would have caught a desktop that looked broken. XFCE
+# ships an xsettings.xml naming Greybird and elementary-xfce-dark, both of them
+# Recommends -- so with no-install-recommends it asked for a theme and an icon
+# set that were not in the image, GTK fell back to its built-in default with no
+# icon theme, and the session came up looking like a fault. Nothing failed; there
+# was no log line. So: every name the appearance defaults mention has to resolve
+# to a directory in the image, and every icon theme those inherit from too.
+cfg=/etc/xdg/xfce4/xfconf/xfce-perchannel-xml
+gtk_theme=$(podman exec "$NAME" sed -n 's/.*"ThemeName".*value="\([^"]*\)".*/\1/p'     "$cfg/xsettings.xml")
+icon_theme=$(podman exec "$NAME" sed -n 's/.*"IconThemeName".*value="\([^"]*\)".*/\1/p' "$cfg/xsettings.xml")
+curs_theme=$(podman exec "$NAME" sed -n 's/.*"CursorThemeName".*value="\([^"]*\)".*/\1/p' "$cfg/xsettings.xml")
+wm_theme=$(podman exec "$NAME" sed -n 's/.*"theme".*value="\([^"]*\)".*/\1/p'           "$cfg/xfwm4.xml")
+
+podman exec "$NAME" test -d "/usr/share/themes/${gtk_theme}/gtk-3.0"     && ok "GTK theme '${gtk_theme}' has a gtk-3.0 directory"     || bad "GTK theme '${gtk_theme}' is named in xsettings.xml but not installed"
+# The one that is easy to miss: xfwm4 draws the window borders from its OWN
+# theme directory, and most GTK themes do not ship one. Without it the frames
+# fall back to "Default" while every widget inside them is themed.
+podman exec "$NAME" test -d "/usr/share/themes/${wm_theme}/xfwm4"     && ok "window manager theme '${wm_theme}' has an xfwm4 directory"     || bad "xfwm4 theme '${wm_theme}' is named in xfwm4.xml but ships no xfwm4/ directory"
+podman exec "$NAME" test -f "/usr/share/icons/${icon_theme}/index.theme"     && ok "icon theme '${icon_theme}' is installed"     || bad "icon theme '${icon_theme}' is named in xsettings.xml but not installed"
+podman exec "$NAME" test -d "/usr/share/icons/${curs_theme}/cursors"     && ok "cursor theme '${curs_theme}' ships cursors"     || bad "cursor theme '${curs_theme}' is named in xsettings.xml but ships no cursors"
+
+# Icon themes inherit, and a missing link in the chain is the same bug one level
+# down. yaru-theme-icon declares no dependencies at all, so nothing but this
+# check keeps Humanity in the image.
+missing=""
+for parent in $(podman exec "$NAME" sed -n 's/^Inherits=//p' "/usr/share/icons/${icon_theme}/index.theme" 2>/dev/null | tr ',' ' '); do
+    podman exec "$NAME" test -f "/usr/share/icons/${parent}/index.theme" || missing="${missing} ${parent}"
+done
+[ -z "$missing" ]     && ok "every icon theme '${icon_theme}' inherits from is installed"     || bad "'${icon_theme}' inherits from missing theme(s):${missing}"
+
+# The interface font, likewise: a name nothing resolves gets silently replaced.
+ui_font=$(podman exec "$NAME" sed -n 's/.*"FontName".*value="\([^"]*\)".*/\1/p' "$cfg/xsettings.xml" | sed 's/ [0-9]*$//')
+podman exec "$NAME" bash -c "fc-list : family | grep -qi '${ui_font}'"     && ok "interface font '${ui_font}' is installed"     || bad "interface font '${ui_font}' is named in xsettings.xml but no such family exists"
+
+# And no launcher on the default panel may point at a program this image lacks.
+# The stock layout ships a Web Browser launcher running `exo-open --launch
+# WebBrowser`; with no browser and no xdg-open that button is dead on arrival.
+dead=""
+for d in $(podman exec "$NAME" sed -n 's/.*value="\([a-z0-9-]*\.desktop\)".*/\1/p' /etc/xdg/xfce4/panel/default.xml 2>/dev/null); do
+    exe=$(podman exec "$NAME" sed -n 's/^Exec=//p' "/usr/share/applications/$d" 2>/dev/null | head -1 | awk '{print $1}')
+    [ -n "$exe" ] && podman exec "$NAME" bash -c "command -v '$exe' >/dev/null" || dead="${dead} ${d}"
+done
+[ -z "$dead" ]     && ok "no launcher on the default panel points at a missing program"     || bad "dead launcher(s) on the default panel:${dead}"
+
+head_ "11. versions recorded in the image"
 podman run --rm -e CIRRUS_DESKTOP_AUTH=none "$IMAGE" bootstrap desktop-versions 2>/dev/null \
     | grep -v '^#' | sed 's/^/  /'
 if podman run --rm -e CIRRUS_DESKTOP_AUTH=none "$IMAGE" bootstrap desktop-versions --check >/dev/null 2>&1; then

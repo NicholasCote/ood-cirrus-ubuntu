@@ -118,6 +118,53 @@ ENV CIRRUS_DESKTOP_HOME=/opt/cirrus-desktop
 #                 directory creation is switched off in etc/xdg/user-dirs.conf
 #                 below, which is the whole point of installing it explicitly.
 #
+# yaru-theme-gtk  Ubuntu's own theme, and the reason the desktop does not look
+# yaru-theme-icon broken. xfce4-settings ships an xsettings.xml naming Greybird
+# and elementary-xfce-dark, both of which are Recommends -- so with
+#                 --no-install-recommends XFCE was asking for a theme and an
+#                 icon set that were not in the image. GTK fell back to its
+#                 built-in Adwaita with no icon theme at all: stock GTK icons,
+#                 a grey square for "File System", raw window frames. Confirmed
+#                 from a screenshot of a live session, not from taste.
+#
+#                 Yaru is the pick because it is the only GTK theme in the
+#                 archive that also ships an xfwm4 variant, so the window
+#                 decorations match rather than falling back to "Default":
+#                   themes/Yaru-dark/{gtk-2.0,gtk-3.0,gtk-4.0,metacity-1,xfwm4}
+#                 It is also literally what an Ubuntu GNOME desktop looks like,
+#                 which is the target. 30 MB with fonts-ubuntu.
+#
+# fonts-ubuntu    Ubuntu's interface font, so the typography matches too. The
+#                 image otherwise has three font families (DejaVu Sans, Mono,
+#                 Serif) and 8 font files.
+#
+# humanity-icon-theme
+# adwaita-icon-theme
+#                 The rest of the icon chain, named explicitly because leaving
+#                 it implicit is the bug this whole block exists to fix.
+#                 yaru-theme-icon declares NO dependencies at all, and every
+#                 Yaru variant's index.theme reads
+#                   Inherits=Yaru,Humanity,hicolor
+#                 so a missing Humanity puts the icons straight back to
+#                 fallbacks. Humanity happened to be in the image already, as a
+#                 dependency of something else -- which is exactly the kind of
+#                 accident that stops being true after an unrelated package
+#                 change. Adwaita is kept as a final fallback for applications
+#                 that ask for GNOME icon names Yaru does not carry.
+#
+# GNOME Shell itself is NOT an option here, and this was tested rather than
+# assumed. Built into a probe image and run under this same X server, it exits:
+#   Gjs-CRITICAL: JS ERROR: Gio.IOErrorEnum: Could not connect: No such file or
+#     directory
+#     LoginManagerSystemd@resource:///org/gnome/shell/misc/loginManager.js:96:9
+#     getLoginManager@resource:///org/gnome/shell/misc/loginManager.js:84:29
+# It requires systemd-logind, which needs systemd as PID 1 -- not available to an
+# unprivileged pod. And separately mutter gets no acceleration here:
+#   libEGL warning: DRI3 error: Could not get DRI3 device
+#   libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+# So the approach is XFCE wearing Ubuntu's GNOME theme, which is the look without
+# the login manager and the GL compositor.
+#
 # Deliberately NOT installed: tumbler. Thunar Recommends it for thumbnails, and
 # --no-install-recommends leaves it out. Thumbnails are a cache written per
 # image file, and the cost of them is an extra writer aimed at the home
@@ -140,6 +187,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
         xdg-user-dirs \
         adwaita-icon-theme \
         fonts-dejavu-core \
+        fonts-ubuntu \
+        humanity-icon-theme \
         libgl1 \
         libglx-mesa0 \
         mousepad \
@@ -152,6 +201,8 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
         xfconf \
         xfdesktop4 \
         xfwm4 \
+        yaru-theme-gtk \
+        yaru-theme-icon \
     && rm -rf /var/lib/apt/lists/*
 
 # ---------------------------------------------------------------------------
@@ -210,6 +261,23 @@ RUN mkdir -p /tmp/.X11-unix /tmp/.ICE-unix && chmod 1777 /tmp/.X11-unix /tmp/.IC
 # stops the writer, that one fixes the readers.
 # ---------------------------------------------------------------------------
 COPY --chmod=0644 etc/xdg/user-dirs.conf /etc/xdg/user-dirs.conf
+
+# ---------------------------------------------------------------------------
+# Appearance and layout defaults.
+#
+# System-wide xfconf defaults and a panel layout, not a runtime seeding step.
+# xfconf reads these through XDG_CONFIG_DIRS and copies them into the user's own
+# channel files on first launch, so a user who changes anything in Settings >
+# Appearance keeps it -- in $HOME/cirrus-desktop/config, like the rest of their
+# desktop state. There is no code to run and nothing to un-seed.
+#
+# Each file says in its own header what it fixes and why. Two of the four are
+# about this transport rather than taste: grayscale antialiasing instead of
+# subpixel, and a flat desktop colour instead of a photograph.
+# ---------------------------------------------------------------------------
+COPY --chmod=0644 etc/xdg/xfce4/xfconf/xfce-perchannel-xml/ \
+     /etc/xdg/xfce4/xfconf/xfce-perchannel-xml/
+COPY --chmod=0644 etc/xdg/xfce4/panel/default.xml /etc/xdg/xfce4/panel/default.xml
 
 # ---------------------------------------------------------------------------
 # Our scripts. /usr/local/bin is on PATH for the entrypoint and for every

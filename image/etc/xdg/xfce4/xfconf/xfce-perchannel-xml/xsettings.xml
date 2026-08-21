@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Appearance defaults for the CIRRUS desktop.
+
+  This file replaces the one xfce4-settings ships, which names Greybird and
+  elementary-xfce-dark. Those are Recommends of the XFCE packages, and this
+  image is built with no-install-recommends (as this image is built), so neither was present: XFCE
+  asked for a theme and an icon set that did not exist, GTK fell back to its
+  built-in Adwaita with no icon theme at all, and the result looked broken
+  rather than minimal. Verified from a screenshot of a live session  -  stock
+  GTK icons, a grey square where "File System" should have an icon, and raw
+  window decorations.
+
+  Yaru is Ubuntu's own theme, so this is the look of an Ubuntu GNOME desktop
+  rather than an approximation of one, and it is the one GTK theme in the
+  archive that also ships an xfwm4 variant  -  so the window borders match
+  instead of falling back to the 1990s "Default" frame. Verified from the
+  package contents:
+      themes/Yaru-dark/gtk-2.0  gtk-3.0  gtk-4.0  metacity-1  xfwm4
+
+  Everything here is a DEFAULT. xfconf copies it into the user's own channel
+  file on first launch, so anything changed in Settings > Appearance wins from
+  then on and persists in $HOME/cirrus-desktop/config.
+-->
+<channel name="xsettings" version="1.0">
+  <property name="Net" type="empty">
+    <property name="ThemeName" type="string" value="Yaru-dark"/>
+    <property name="IconThemeName" type="string" value="Yaru-dark"/>
+    <property name="DoubleClickTime" type="int" value="400"/>
+    <property name="DoubleClickDistance" type="int" value="5"/>
+    <property name="DndDragThreshold" type="int" value="8"/>
+    <property name="CursorBlink" type="bool" value="true"/>
+    <property name="CursorBlinkTime" type="int" value="1200"/>
+    <property name="SoundThemeName" type="string" value="default"/>
+    <!-- There is no audio path through the OnDemand proxy, so an event sound is
+         a file read and a decode that nobody can hear. -->
+    <property name="EnableEventSounds" type="bool" value="false"/>
+    <property name="EnableInputFeedbackSounds" type="bool" value="false"/>
+  </property>
+  <property name="Xft" type="empty">
+    <property name="DPI" type="int" value="96"/>
+    <property name="Antialias" type="int" value="1"/>
+    <property name="Hinting" type="int" value="1"/>
+    <property name="HintStyle" type="string" value="hintslight"/>
+    <!--
+      Grayscale antialiasing, NOT subpixel, and this is the one appearance
+      setting here that is about the transport rather than taste.
+
+      Subpixel rendering ("rgb") colours the edge of every glyph on the
+      assumption that it lands on a physical LCD stripe in that order. This
+      framebuffer does not: it is JPEG/WebP encoded by KasmVNC and decoded in a
+      browser at whatever scale the window happens to be. The coloured fringes
+      survive as visible artefacts and cost bitrate to send, because chroma
+      detail is exactly what a lossy encoder is trying to throw away.
+
+      The upstream default is "none" already; it is spelled out here so that
+      nobody "improves" it to rgb later.
+    -->
+    <property name="RGBA" type="string" value="none"/>
+  </property>
+  <property name="Gtk" type="empty">
+    <property name="CanChangeAccels" type="bool" value="false"/>
+    <!-- Ubuntu's interface font, at Ubuntu's size. -->
+    <property name="FontName" type="string" value="Ubuntu 11"/>
+    <property name="MonospaceFontName" type="string" value="Ubuntu Mono 13"/>
+    <property name="IconSizes" type="string" value=""/>
+    <property name="KeyThemeName" type="string" value=""/>
+    <property name="ToolbarStyle" type="string" value="icons"/>
+    <property name="ToolbarIconSize" type="int" value="3"/>
+    <property name="MenuImages" type="bool" value="true"/>
+    <property name="ButtonImages" type="bool" value="true"/>
+    <property name="MenuBarAccel" type="string" value="F10"/>
+    <property name="CursorThemeName" type="string" value="Yaru"/>
+    <property name="CursorThemeSize" type="int" value="24"/>
+    <property name="DecorationLayout" type="string" value="icon:minimize,maximize,close"/>
+    <property name="DialogsUseHeader" type="bool" value="false"/>
+    <property name="TitlebarMiddleClick" type="string" value="lower"/>
+  </property>
+  <property name="Gdk" type="empty">
+    <property name="WindowScalingFactor" type="int" value="1"/>
+  </property>
+</channel>

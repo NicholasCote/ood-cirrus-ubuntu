@@ -167,8 +167,12 @@ setup_nss_wrapper() {
     # the passwd entry, and /bin/sh here is dash: no readline, so the arrow keys
     # emit ^[[A instead of walking history -- a terminal that looks broken to
     # anyone who has used one before.
-    printf '%s:x:%s:%s:CIRRUS desktop user:%s:/bin/bash\n' \
-        "$want_name" "$uid" "$gid" "$HOME" >> "$passwd_file"
+    # The GECOS field is not decoration here: xfce4-panel's action button and
+    # the log-out dialog both display the full name from the passwd entry, so a
+    # literal "CIRRUS desktop user" is what a session greets you with. OOD gives
+    # us the account name and nothing else, so that is what goes here.
+    printf '%s:x:%s:%s:%s:%s:/bin/bash\n' \
+        "$want_name" "$uid" "$gid" "$want_name" "$HOME" >> "$passwd_file"
 
     if [ -n "$want_group" ]; then
         grep -v "^[^:]*:[^:]*:${gid}:" /etc/group > "$group_file" 2>/dev/null || true
