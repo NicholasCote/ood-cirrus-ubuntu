@@ -1,13 +1,3 @@
-<%#
-  Rendered into the session card by the dashboard.
-
-  The binding here is the BatchConnect::Session, so user_context is available --
-  the launch form values, read back from user_defined_context.json. That is a
-  different binding from view.html.erb, which sees only the connection info and
-  the keys of <pod>-secret.
-
-  Keys are form attribute ids, so this tracks form.yml.
--%>
 <%- cpus = user_context["cpu"].to_s.strip -%>
 <%- mem  = user_context["memory"].to_s.strip -%>
 <%- unless cpus.empty? || mem.empty? -%>

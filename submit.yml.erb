@@ -1,130 +1,18 @@
 <%-
   # ---------------------------------------------------------------------------
-  # The image. Fixed here, not offered on the form: which container the desktop
-  # runs in is not a decision someone opening a desktop should have to make, and
-  # a wrong answer produces a session that dies instantly.
-  #
-  # Pinned to an explicit tag. CI publishes date tags (%Y-%m-%d.%H.%M); bump this
-  # to the tag you have tested, never to something floating. The CI run's job
-  # summary carries the line to paste.
-  #
-  # NEEDS BUMPING. The tag below connects correctly (it carries the websocket
-  # path fix) but predates three more:
-  #
-  #   * the appearance. xfce4-settings ships an xsettings.xml naming Greybird
-  #     and elementary-xfce-dark, both Recommends, so with
-  #     --no-install-recommends the desktop asked for a theme and an icon set
-  #     that were not installed. The image now carries Yaru, the Ubuntu font and
-  #     system-wide xfconf defaults.
-  #
-  #   * a browser. With none installed, XFCE's Web Browser launcher and any URL
-  #     click call `exo-open --launch WebBrowser`, which does not fail - it
-  #     blocks on a GTK dialog. GNOME Web is installed now (Firefox and Chromium
-  #     are snap-only in the noble archive), along with GSK_RENDERER=cairo,
-  #     without which a GTK4 window never maps on this X server.
-  #
-  #   * the self-help toolchain. There is no root in a session, so anything a
-  #     user needs beyond the image they install into their home - and the image
-  #     had no compiler, no pip (venv could not provision it) and no xz, so
-  #     most upstream tarballs could not even be unpacked. build-essential,
-  #     python3-dev/pip/venv and the archive tools are in now.
-  #
-  #   * the XDG user directories. All eight now resolve inside
-  #     $HOME/cirrus-desktop rather than seven of them pointing at $HOME, so a
-  #     download lands under this app's own directory instead of loose in a home
-  #     shared with Casper and Derecho. Existing sessions are upgraded in place.
-  #
-  # Re-run CI and pin the new tag.
-  # ---------------------------------------------------------------------------
-  desktop_img = "hub.k8s.ucar.edu/ncote/ubuntu-desktop:2026-08-21.19.15"
+  desktop_img = "hub.k8s.ucar.edu/ncote/ubuntu-desktop:2026-08-21.20.47"
 
-  # Ohio Supercomputer Center's helper image, the same one the other CIRRUS OOD
-  # apps use. Provides kubectl plus /bin/save_passwd_as_secret and
-  # /bin/passwd_from_secret.
   utility_img = "docker.io/ohiosupercomputer/ood-k8s-utils:latest"
 
   user = OodSupport::User.new
 
-  # How long a session may sit with nothing connected before it ends itself, and
-  # how often that is checked. Enforced by the watchdog in the image's
-  # entrypoint, which asks KasmVNC directly:
-  #
-  #   $ curl -u <user>:<pw> http://127.0.0.1:8082/api/get_sessions
-  #   {"users":[]}                                              nobody attached
-  #   {"users": [{"username":"ncote","connected_since":"..."}]}  a real client
-  #
-  # Measured on this image: a websocket that upgrades but never completes the
-  # RFB handshake does NOT appear in that list, so neither the startup probe nor
-  # a half-open connection can keep an abandoned desktop alive. An hour is far
-  # clear of a false positive, and the acceptance test asserts that a session
-  # with a client attached is not culled.
-  #
-  # A desktop is worth culling more than an IDE is: an idle XFCE session is a
-  # dozen processes plus the framebuffer, and nothing outside the pod will
-  # reclaim it.
   idle_timeout = 3600
   idle_check_interval = 300
 
-  # Hard ceiling on a session, and the backstop for the one case idle culling
-  # structurally cannot catch: a tab left open in the foreground, which keeps a
-  # client connected forever however long nobody touches it.
-  #
-  # Deliberately not a form field. As "Wall time (hours)" it would render a
-  # 00h00m00s lifetime whenever the value went missing, and a reaper honours
-  # that instantly -- killing every session the moment it starts.
-  #
-  # Enforced twice, on purpose. As wall_time it becomes a
-  # pod.kubernetes.io/lifetime annotation, which means something only because
-  # OSC's job-pod-reaper is deployed on this cluster; the entrypoint's watchdog
-  # enforces the same number from inside, where nothing else has to be deployed
-  # for it to work, and where it can exit 0.
   max_session_hours = 12
 
-  # No local is assigned a name that is also a form field. Form values arrive as
-  # methods, and `cpu = cpu.to_i` would make `cpu` a local for the whole scope,
-  # so the right-hand side reads the unassigned local (nil) instead of the form
-  # value. Ruby decides that at parse time, so there is no error to notice -- in
-  # the sibling workshop app an `editor` field assigned to an `editor` local made
-  # every VS Code launch start JupyterLab. Nothing below assigns to cpu or
-  # memory; they are read inline with .to_i.
-
-  # ---------------------------------------------------------------------------
-  # The proxy. /rnode/, and this is not interchangeable with /node/.
-  #
-  # OnDemand ships two:
-  #   /node/HOST/PORT/...   forwards the whole path, prefix included.
-  #   /rnode/HOST/PORT/...  strips the prefix and forwards the remainder, and
-  #                         then rewrites the response headers on the way out.
-  #
-  # KasmVNC needs the stripping one, and it is well suited to it. Measured on
-  # this image:
-  #
-  #   * its client page references no root-absolute asset -- every one is
-  #     ./assets/... -- and the bundle builds both the websocket URL and the
-  #     secondary-monitor URL from window.location.pathname, so a stripped
-  #     prefix is invisible to it;
-  #   * the only Location it ever emits is a trailing-slash 301 on a directory
-  #     path, root-relative and unprefixed:
-  #         GET /app  ->  301, Location: /app/
-  #     which the /rnode/ rule turns into /rnode/<node>/<port>/app/. Anything
-  #     that already carried the prefix would get it twice and land the browser
-  #     on the dashboard's 404.
-  #
-  # So nothing in the pod is told the prefix, with one exception: the gate's
-  # login form action, which lives in a response BODY, and bodies are not
-  # rewritten. It contains the node name and the assigned NodePort, neither of
-  # which exists until the pod is scheduled and its service created -- so it
-  # cannot come from this file. The add-baseurl-to-cfg init container computes it
-  # into the ConfigMap and the entrypoint reads it.
-  # ---------------------------------------------------------------------------
   base_url_file = "base_url"
 
-  # The password file the container waits on. One ConfigMap, one mount path:
-  # ood_core emits a volumeMount per file that declares one, and each of those
-  # mounts the whole ConfigMap volume, so two files naming the same mount_path
-  # produce duplicate mountPaths and the API server rejects the pod:
-  #   spec.containers[0].volumeMounts[1].mountPath: "/ood": must be unique
-  # Files with no mount_path are still projected into /ood alongside it.
   passwd_file = "csenv"
 -%>
 ---
@@ -136,68 +24,29 @@ script:
     container:
       name: "ubuntu-desktop"
       image: "<%= desktop_img %>"
-      # The image's own entrypoint. Every token is space-free on purpose:
-      # ood_core renders this into the pod's `command` array by splitting on
-      # whitespace, so a quoted argument would not survive.
       command: "/usr/local/bin/entrypoint.sh desktop"
       restart_policy: "OnFailure"
-      # Start in the user's GLADE home. The image's own WORKDIR is irrelevant
-      # here and the session runs as the user's real uid, so nothing will cd for
-      # us.
       working_dir: "<%= user.home %>"
       env:
         HOME: "<%= user.home %>"
-        # USER, NB_USER and GROUP are the authority for the session's identity.
-        # The pod runs as the user's real NFS uid, which has no /etc/passwd entry
-        # in the image -- and a container runtime may synthesise one whose name
-        # is the uid itself, so "does an entry exist" is the wrong test. The
-        # entrypoint uses these three to give the uid a real name through
-        # nss_wrapper. A desktop needs it in more places than an IDE does: the
-        # terminal prompt, whoami, git's committer identity, ssh's default user,
-        # the session's own Log Out menu, and Thunar's idea of where home is.
         USER: "<%= user.name %>"
         NB_USER: "<%= user.name %>"
         GROUP: "<%= user.group.name %>"
 
         CIRRUS_DESKTOP_PORT: "8080"
 
-        # Per-session password, enforced by the gate in front of KasmVNC.
-        #
-        # KasmVNC does authenticate for real -- HTTP Basic on every request,
-        # including the /websockify upgrade, with brute-force blacklisting. What
-        # it cannot do is be signed into without the user typing something:
-        # Basic auth is a header the browser only sends after its own native
-        # dialog, so the Connect button (a form POST) has no way to supply it,
-        # and browsers cache Basic credentials per ORIGIN -- which every session
-        # on this OnDemand host shares. The gate turns one POST from the
-        # dashboard into a cookie and adds the Authorization header itself, so
-        # the user types nothing and KasmVNC's own auth stays on behind it.
         CIRRUS_DESKTOP_AUTH: "password"
         CIRRUS_DESKTOP_PASSWORD_FILE: "/ood/<%= passwd_file %>"
 
-        # Written by the add-baseurl-to-cfg init container below.
         CIRRUS_DESKTOP_BASE_URL_FILE: "/ood/<%= base_url_file %>"
 
         CIRRUS_DESKTOP_IDLE_TIMEOUT: "<%= idle_timeout %>"
         CIRRUS_DESKTOP_IDLE_CHECK: "<%= idle_check_interval %>"
-        CIRRUS_DESKTOP_MAX_LIFETIME: "<%= max_session_hours * 3600 %>"
-
-        # Only the size before the first client attaches -- KasmVNC's web client
-        # sends SetDesktopSize on connect and the desktop follows the browser
-        # window from then on. Hence no resolution field on the form.
+        CIRRUS_DESKTOP_MAX_LIFETIME: "<%= max_session_hours * 36
         CIRRUS_DESKTOP_GEOMETRY: "1600x900"
       port: 8080
       cpu: "<%= cpu.to_i %>"
       memory: "<%= memory.to_i %>Gi"
-      # ood_core's default startup probe allows 2s + 5 x 5s = 27s for the port to
-      # open, and that is nowhere near enough here. Before the port is bound the
-      # entrypoint waits for the init container's password to land in the
-      # projected ConfigMap file -- volumes are projected before init containers
-      # run, so the file is present and empty until kubelet re-projects it --
-      # creates directories in a GLADE home over NFS, brings up a session bus,
-      # and waits for an X server to report itself ready. Measured locally the
-      # port answers in about two seconds; the waits are what need the budget.
-      # Allow five minutes.
       startup_probe:
         initial_delay_seconds: 5
         failure_threshold: 60
@@ -210,86 +59,22 @@ script:
         destination_path: "<%= user.home %>"
     configmap:
       files:
-        # Placeholder content only. Both keys are declared here so the ConfigMap
-        # volume and its /ood mount exist from the moment the pod is created; the
-        # init containers below overwrite the values. The entrypoint greps for
-        # '^password=', so this seed line never matches.
         - filename: "<%= passwd_file %>"
           mount_path: "/ood"
           data: |
-            # session password is written here by the add-passwd-to-cfg init container
-        # Starts empty; add-baseurl-to-cfg replaces it with the computed prefix.
-        # No mount_path of its own -- see the note above about duplicate mounts.
         - filename: "<%= base_url_file %>"
           data: |
     init_containers:
-      # Generate a random password into <pod>-secret. OnDemand's kubernetes
-      # adapter reads that Secret back and exposes every key in it to
-      # view.html.erb, which is where the `password` local there comes from. So
-      # both ends agree on the password without it ever being rendered into an
-      # app template or written to the user's home.
       - name: "init-secret"
         image: "<%= utility_img %>"
         command:
           - "/bin/save_passwd_as_secret"
-
-      # Copy it into the ConfigMap so the container itself can read it. The
-      # Secret is not mounted into the pod, and the session container has no
-      # kubectl and no RBAC to fetch it.
-      #
-      # No double quotes anywhere in these command arrays, and that is
-      # load-bearing rather than a style choice: ood_core re-emits every element
-      # into its own pod.yml.erb as `- "<the element>"`, so a double quote closes
-      # that YAML string early and the whole manifest fails to parse with
-      # "error converting YAML to JSON: did not find expected key". Surviving two
-      # YAML passes takes four backslashes; not needing to is better.
-      #
-      # Nothing needs quoting here anyway: create_passwd builds the password from
-      # [a-zA-Z0-9] only, so $PASSWORD expands to exactly one word.
-      #
-      # `kubectl patch --type=merge`, and NOT `kubectl apply` -- this is the whole
-      # reason the helper /bin/add_line_to_configmap is not used here. That helper
-      # does `kubectl create configmap --from-file <one key> --dry-run -o yaml |
-      # kubectl apply -f -`, and apply is declarative: it records the manifest it
-      # applied in kubectl.kubernetes.io/last-applied-configuration and, on the
-      # next apply, DELETES every key present in that annotation and absent from
-      # the new manifest. Two init containers each applying their own single key
-      # therefore erase each other, and the container sits in "waiting for the
-      # session password at /ood/csenv" until the startup probe kills it.
-      #
-      # A merge patch touches only the keys named in the patch and leaves the rest
-      # of the object alone, and it writes no annotation, so neither step can ever
-      # prune the other's key regardless of the order they run in.
-      #
-      # The patch is YAML, not JSON: kubectl runs the -p argument through
-      # yaml.ToJSON, so a flow mapping works and no double quote is needed. The
-      # shell word is built by concatenating single-quoted literals around the
-      # expansion -- 'data: {csenv: password='$PASSWORD'}' is one word, since only
-      # unquoted whitespace splits.
       - name: "add-passwd-to-cfg"
         image: "<%= utility_img %>"
         command:
           - "/bin/bash"
           - "-c"
           - "source /bin/passwd_from_secret; kubectl patch configmap $(hostname)-configmap --type=merge -p 'data: {<%= passwd_file %>: password='$PASSWORD'}'"
-
-      # Compute /rnode/<nodeName>/<nodePort>/ and write it where the container
-      # will read it. This cannot come from the pod spec: the NodePort is
-      # assigned when the service is created and the node name when the pod is
-      # scheduled.
-      #
-      # `kubectl patch --type=merge` with a YAML flow-mapping patch, for the
-      # reason spelled out on add-passwd-to-cfg above: an apply here prunes the
-      # password key that step just wrote.
-      #
-      # `get`, never `list`: the pod's service account is `default`, which can get
-      # pods and services in its namespace and cannot list them.
-      #
-      # No `|| true`. Without the prefix the gate's login form posts to the
-      # OnDemand dashboard's own root, so anyone who reaches the login page --
-      # rather than arriving through the Connect button -- lands on a 404 with
-      # nothing anywhere they can read. Failing the init container instead leaves
-      # the reason in `kubectl logs <pod> -c add-baseurl-to-cfg`.
       - name: "add-baseurl-to-cfg"
         image: "<%= utility_img %>"
         command:

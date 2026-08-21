@@ -27,25 +27,3 @@ attributes:
     step: 1
     required: true
 
-# Deliberately short, and each omission is a decision rather than an oversight.
-#
-# No wall time. As a form field it renders a 00h00m00s lifetime whenever the
-# value goes missing, and the reaper honours that instantly -- killing every
-# session the moment it launches. The ceiling is set in submit.yml.erb and
-# enforced by the watchdog in the image.
-#
-# No screen resolution. KasmVNC's web client sends SetDesktopSize on connect
-# (AcceptSetDesktopSize defaults to 1, and the image leaves it there), so the
-# desktop is already the size of the browser window and follows it when the
-# window is resized. A resolution field would be a value the session overrides
-# a second later. The initial geometry is CIRRUS_DESKTOP_GEOMETRY in the image,
-# and it only matters for the moment before the first client attaches.
-#
-# No working directory, unlike the RStudio and VS Code apps. There is no single
-# thing a desktop "opens": the file manager starts at your home, and a terminal
-# starts wherever you open it. A field that only changed which folder Thunar
-# happened to show first would not be worth the validation it needs.
-#
-# No image field. Which container the desktop runs in is not a decision someone
-# opening a desktop should have to make, and a wrong answer produces a session
-# that dies instantly.
