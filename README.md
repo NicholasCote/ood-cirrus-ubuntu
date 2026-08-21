@@ -477,7 +477,7 @@ podman build -t localhost/cirrus-desktop:dev -f image/Dockerfile image
 image/test/acceptance.sh
 ```
 
-Last run, 42 checks, all passing:
+Last run, 45 checks, all passing:
 
 ```
 == 1. arbitrary uid, runtime-synthesised numeric passwd entry ==
@@ -533,7 +533,11 @@ Last run, 42 checks, all passing:
   ok   every icon theme 'Yaru-dark' inherits from is installed
   ok   interface font 'Ubuntu' is installed
   ok   no launcher on the default panel points at a missing program
-== 11. versions recorded in the image ==
+== 11. a browser, and the renderer GTK4 needs to draw one ==
+  ok   exo-open --launch WebBrowser returns (it blocks on a dialog with no browser)
+  ok   xdg-open exists (what GTK apps and terminals actually call)
+  ok   GSK_RENDERER=cairo is set (GTK4 windows map without DRI3)
+== 12. versions recorded in the image ==
   ok   desktop-versions --check agrees with the record
 ```
 
@@ -692,6 +696,80 @@ real defect:
 Nothing on the new panel is a launcher, so nothing on it can be dead — and the
 acceptance suite now checks that claim for whatever layout is shipped.
 
+### A browser, and the renderer GTK4 needs in order to draw one
+
+Clicking the panel's Web Browser button reported *"Failed to execute default Web
+Browser"*. Not a missing feature — a control that fails. XFCE's stock panel ships
+that launcher running `exo-open --launch WebBrowser`, and with nothing to launch
+the call does not error out, it **blocks on a GTK dialog**: measured,
+`exo-open --launch WebBrowser https://example.com` never returned. Removing the
+launcher would not have been enough either, because clicking a URL anywhere calls
+the same helper.
+
+**GNOME Web, and that is forced rather than chosen.** In the noble archive both
+of the obvious answers are snap transition packages:
+
+```
+firefox           1:1snap1-0ubuntu5
+chromium-browser  2:1snap1-0ubuntu2
+```
+
+and snap does not work in a container. `epiphany-browser` 46.5 is a real deb, it
+is GNOME's own browser, and exo already ships a helper naming its binary:
+
+```
+epiphany.desktop   X-XFCE-Binaries=epiphany;org.gnome.Epiphany;
+```
+
+so `exo-open` finds it with **no configuration at all** — verified, exit 0. Plus
+`xdg-utils`, because GTK apps and terminal workflows call `xdg-open` rather than
+`exo-open`. WebKit's `bwrap` sandbox works unprivileged here, which was the risk
+worth checking:
+
+```
+/usr/bin/bwrap --args 37 -- /usr/lib/x86_64-linux-gnu/webkitgtk-6.0/WebKitWebProcess
+```
+
+**And then it still did not draw anything.** Epiphany ran, its WebKit processes
+ran, nothing was logged, and the screen stayed empty. GNOME Web 46 is a **GTK4**
+application; GTK4 renders through GSK, whose default backend is GL, and this X
+server provides no DRI3:
+
+```
+libEGL warning: DRI3 error: Could not get DRI3 device
+libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+```
+
+So GSK could not create a context and the window never mapped. `GSK_RENDERER=cairo`
+in the image environment fixes it, and the same command then renders the page.
+
+This is the failure mode worth remembering: **nothing else in the image showed
+it, because XFCE, Thunar and Mousepad are all GTK3**, which uses cairo on X11
+already. It only appears the first time a GTK4 application is added — which is
+exactly when nobody is looking for it. `GTK_A11Y=none` is set alongside it for the
+log rather than the screen; there is no accessibility bus in a session pod, and
+GTK names the variable itself in the warning.
+
+A side note on the debugging, because it cost time: `timeout 20 epiphany …`
+reported *"Web process crashed"* three times, which looked like a WebKit sandbox
+failure. It was not — those messages appear at exactly the moment `timeout` sends
+its SIGTERM. Run detached there were no crashes at all, and the several
+`WebKitWebProcess` instances were tabs from earlier launch attempts, not respawns.
+A test harness that kills the thing it is measuring will describe the killing.
+
+### An existing session keeps its old panel
+
+`xfce4-panel` copies `/etc/xdg/xfce4/panel/default.xml` into the user's own
+configuration on **first** launch. So a session that has run before keeps the
+layout it already has, dock and all, in `$HOME/cirrus-desktop/config/xfce4/panel/`
+— a new default does not reach it, and the entrypoint deliberately does not go
+editing a configuration the user owns.
+
+Which is the main reason installing a browser was the right fix rather than only
+removing the launcher: the old dock's Web Browser button now **works** instead of
+needing surgery. Anyone who wants the new single-bar layout can delete
+`~/cirrus-desktop/config/xfce4/panel/` and relaunch.
+
 ### Light or dark
 
 `Yaru-dark` is the default. For the light variant, change the four names in
@@ -716,9 +794,14 @@ XFCE core — session, window manager, panel, desktop, settings — plus
 xfce4-terminal, Thunar, Mousepad and xfce4-appfinder. Then `git`, `less`,
 `nano`, `curl`, `openssh-client` for the terminal, and `python3` for the gate.
 Appearance: `yaru-theme-gtk`, `yaru-theme-icon`, `humanity-icon-theme`,
-`adwaita-icon-theme`, `fonts-ubuntu`, `fonts-dejavu-core`. Roughly 780 MB — the
-theme and font packages account for about 145 MB of that, which is the price of
-not looking broken.
+`adwaita-icon-theme`, `fonts-ubuntu`, `fonts-dejavu-core`. And
+`epiphany-browser` plus `xdg-utils`, so that clicking a URL does something.
+
+Roughly 980 MB: about 145 MB of that is theme and fonts, and about 200 MB is the
+browser and WebKit. Both are one-time pulls per node, cached by Harbor. To drop
+the browser, remove `epiphany-browser` and `xdg-utils` from the Dockerfile — and
+leave the panel default without a browser launcher, because the two go
+together.
 
 That is the deliberate scope: the reason to open a desktop here is to look at
 and manipulate files on GLADE, and everything beyond that a user brings from
@@ -727,8 +810,9 @@ cold node.
 
 Notable omissions:
 
-* **No browser.** Firefox in the Ubuntu archive is a snap, which is unusable in
-  a container; a real one means adding Mozilla's APT repository and ~250 MB.
+* **No Firefox or Chromium.** Both are snap transition packages in the noble
+  archive and snap does not work in a container. GNOME Web is installed instead;
+  Firefox would mean adding Mozilla's own APT repository and ~250 MB.
 * **No `tumbler`.** Thunar *Recommends* it for thumbnails and
   `--no-install-recommends` leaves it out. Thumbnails are a cache written per
   image file — one more writer aimed at the home directory. Image previews in

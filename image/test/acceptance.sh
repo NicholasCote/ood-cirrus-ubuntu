@@ -533,7 +533,37 @@ for d in $(podman exec "$NAME" sed -n 's/.*value="\([a-z0-9-]*\.desktop\)".*/\1/
 done
 [ -z "$dead" ]     && ok "no launcher on the default panel points at a missing program"     || bad "dead launcher(s) on the default panel:${dead}"
 
-head_ "11. versions recorded in the image"
+head_ "11. a browser, and the renderer GTK4 needs to draw one"
+# The symptom this covers is a control that fails rather than a missing feature.
+# XFCE's stock panel ships a Web Browser launcher running `exo-open --launch
+# WebBrowser`, and with nothing to launch that call does not error - it blocks on
+# a GTK dialog. So the test is that it RETURNS, not merely that a package is
+# installed: a hang and a success are the same exit code to a naive check.
+if podman exec "$NAME" bash -c '
+      export DISPLAY=:0 HOME=/tmp/h \
+        XDG_RUNTIME_DIR=/tmp/cirrus-desktop/run \
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/tmp/cirrus-desktop/run/bus
+      timeout 20 exo-open --launch WebBrowser about:blank >/dev/null 2>&1' 2>/dev/null; then
+    ok "exo-open --launch WebBrowser returns (it blocks on a dialog with no browser)"
+else
+    bad "exo-open --launch WebBrowser did not return; a URL click will hang on a dialog"
+fi
+# xdg-open is the other half: GTK apps and terminal workflows call it, not exo.
+podman exec "$NAME" bash -c 'command -v xdg-open >/dev/null' \
+    && ok "xdg-open exists (what GTK apps and terminals actually call)" \
+    || bad "no xdg-open; clicking a link from a GTK app or a terminal fails"
+
+# GSK_RENDERER, and this is the one whose absence is silent. GTK4 renders through
+# GSK, whose default backend is GL; this X server has no DRI3, so GSK cannot make
+# a context and the window never maps - no error, no log line, an empty screen.
+# Measured on GNOME Web, which is GTK4. Nothing else here is, so the day someone
+# adds a second GTK4 application is the day this matters again.
+gsk=$(podman exec "$NAME" bash -c 'printf %s "${GSK_RENDERER:-}"')
+[ "$gsk" = "cairo" ] \
+    && ok "GSK_RENDERER=cairo is set (GTK4 windows map without DRI3)" \
+    || bad "GSK_RENDERER is '${gsk:-unset}'; a GTK4 window will silently never appear"
+
+head_ "12. versions recorded in the image"
 podman run --rm -e CIRRUS_DESKTOP_AUTH=none "$IMAGE" bootstrap desktop-versions 2>/dev/null \
     | grep -v '^#' | sed 's/^/  /'
 if podman run --rm -e CIRRUS_DESKTOP_AUTH=none "$IMAGE" bootstrap desktop-versions --check >/dev/null 2>&1; then

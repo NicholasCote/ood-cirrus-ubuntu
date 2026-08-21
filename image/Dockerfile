@@ -165,6 +165,34 @@ ENV CIRRUS_DESKTOP_HOME=/opt/cirrus-desktop
 # So the approach is XFCE wearing Ubuntu's GNOME theme, which is the look without
 # the login manager and the GL compositor.
 #
+# epiphany-browser
+# xdg-utils      A browser, because without one the desktop has a control that
+#                fails. XFCE's stock panel ships a Web Browser launcher running
+#                `exo-open --launch WebBrowser`, and with nothing to launch that
+#                call does not error out - it blocks on a GTK dialog. Measured:
+#                `exo-open --launch WebBrowser https://example.com` never
+#                returned. Clicking a URL anywhere does the same thing, so
+#                removing the launcher would not have been enough.
+#
+#                GNOME Web (epiphany) rather than Firefox or Chromium, and that
+#                is forced rather than chosen: in the noble archive both of those
+#                are snap transition packages -
+#                  firefox           1:1snap1-0ubuntu5
+#                  chromium-browser  2:1snap1-0ubuntu2
+#                - and snap does not work in a container. epiphany-browser 46.5
+#                is a real deb, it is GNOME's own browser, and exo already ships
+#                a helper naming its binary
+#                  epiphany.desktop  X-XFCE-Binaries=epiphany;org.gnome.Epiphany;
+#                so exo-open finds it with no configuration at all. Verified:
+#                exit 0, and WebKit's bwrap sandbox works unprivileged.
+#
+#                xdg-utils for xdg-open, which is what GTK apps and terminal
+#                workflows call rather than exo-open.
+#
+#                ~200 MB installed. If that is not wanted, drop both packages
+#                AND leave the panel default without a browser launcher - the
+#                two go together.
+#
 # Deliberately NOT installed: tumbler. Thunar Recommends it for thumbnails, and
 # --no-install-recommends leaves it out. Thumbnails are a cache written per
 # image file, and the cost of them is an extra writer aimed at the home
@@ -192,7 +220,9 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
         libgl1 \
         libglx-mesa0 \
         mousepad \
+        epiphany-browser \
         thunar \
+        xdg-utils \
         xfce4-appfinder \
         xfce4-panel \
         xfce4-session \
@@ -318,6 +348,7 @@ RUN set -eu; \
       printf 'thunar\t%s\n'      "$(dpkg-query -W -f='${Version}' thunar)"; \
       printf 'python3\t%s\n'     "$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"; \
       printf 'git\t%s\n'         "$(git --version | awk '{print $3}')"; \
+      printf 'epiphany\t%s\n'    "$(dpkg-query -W -f='${Version}' epiphany-browser)"; \
     } > "${CIRRUS_DESKTOP_HOME}/versions.txt"; \
     lib="$(ldconfig -p | awk -F'=> ' '/libnss_wrapper/ {print $2; exit}' | tr -d ' ')"; \
     if [ -z "$lib" ] || [ ! -r "$lib" ]; then \
@@ -340,7 +371,32 @@ ENV CIRRUS_DESKTOP_PORT=8080 \
     CIRRUS_DESKTOP_STATE_DIR=/tmp/cirrus-desktop \
     CIRRUS_DESKTOP_AUTH=password \
     CIRRUS_DESKTOP_GEOMETRY=1600x900 \
-    NO_AT_BRIDGE=1
+    NO_AT_BRIDGE=1 \
+    GTK_A11Y=none \
+    GSK_RENDERER=cairo
+
+# GSK_RENDERER=cairo is load-bearing for every GTK4 application in this image,
+# and its absence fails in the worst possible way: silently.
+#
+# GTK4 renders through GSK, whose default backend is GL. This X server provides
+# no DRI3 -
+#   libEGL warning: DRI3 error: Could not get DRI3 device
+#   libEGL warning: Ensure your X server supports DRI3 to get accelerated rendering
+# - so GSK cannot bring up a GL context, and the window never maps. Measured on
+# GNOME Web: the process ran, its WebKit processes ran under bwrap, nothing was
+# logged, and the screen stayed empty. With GSK_RENDERER=cairo the same command
+# renders the page.
+#
+# Nothing else in this image showed it, because XFCE, Thunar and Mousepad are all
+# GTK3 - which uses cairo on X11 already. So this only appears the first time a
+# GTK4 application is added, which is exactly when nobody is looking for it.
+#
+# GTK_A11Y=none for the log rather than the screen: every GTK application
+# otherwise opens with
+#   Unable to acquire the address of the accessibility bus ... org.a11y.Bus was
+#   not provided by any .service files
+# There is no accessibility bus in a session pod, and GTK says so itself in that
+# message: set GTK_A11Y to none.
 
 # Matches the fixed containerPort/NodePort of the other CIRRUS OOD apps.
 EXPOSE 8080

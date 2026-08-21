@@ -8,13 +8,22 @@
   # to the tag you have tested, never to something floating. The CI run's job
   # summary carries the line to paste.
   #
-  # NEEDS BUMPING for the appearance fix. The tag below carries the websocket
-  # path fix and connects correctly, but predates the theming: xfce4-settings
-  # ships an xsettings.xml naming Greybird and elementary-xfce-dark, both of
-  # them Recommends, so with --no-install-recommends the desktop asked for a
-  # theme and an icon set that were not installed and came up looking like a
-  # fault rather than like a minimal desktop. The image now carries Yaru, the
-  # Ubuntu font and system-wide xfconf defaults. Re-run CI and pin the new tag.
+  # NEEDS BUMPING. The tag below connects correctly (it carries the websocket
+  # path fix) but predates two more:
+  #
+  #   * the appearance. xfce4-settings ships an xsettings.xml naming Greybird
+  #     and elementary-xfce-dark, both Recommends, so with
+  #     --no-install-recommends the desktop asked for a theme and an icon set
+  #     that were not installed. The image now carries Yaru, the Ubuntu font and
+  #     system-wide xfconf defaults.
+  #
+  #   * a browser. With none installed, XFCE's Web Browser launcher and any URL
+  #     click call `exo-open --launch WebBrowser`, which does not fail - it
+  #     blocks on a GTK dialog. GNOME Web is installed now (Firefox and Chromium
+  #     are snap-only in the noble archive), along with GSK_RENDERER=cairo,
+  #     without which a GTK4 window never maps on this X server.
+  #
+  # Re-run CI and pin the new tag.
   # ---------------------------------------------------------------------------
   desktop_img = "hub.k8s.ucar.edu/ncote/ubuntu-desktop:2026-08-21.18.54"
 
