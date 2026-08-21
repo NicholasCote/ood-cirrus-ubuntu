@@ -286,6 +286,26 @@ if ! mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_DATA_HOME" 2>/dev/null; then
     warn "not persist between sessions."
 fi
 
+# --- Python's per-user site directory --------------------------------------
+#
+# PYTHONUSERBASE defaults to $HOME/.local, so `pip install --user` and anything
+# else honouring site.USER_BASE writes to
+# $HOME/.local/lib/python3.12/site-packages -- which is on GLADE and is imported
+# by any Python of the same minor version on Casper and Derecho. A package with a
+# compiled extension built in this container (glibc 2.39, and the image now has
+# a compiler) would then be picked up by HPC Python and fail somewhere else
+# entirely. That is precisely the hazard the sibling RStudio app's R library
+# isolation exists to prevent.
+#
+# Ubuntu 24.04 marks the system Python externally managed, so PEP 668 already
+# refuses the common case -- verified:
+#   $ pip3 install --user six
+#   error: externally-managed-environment
+# A virtual environment is the supported route and works normally. This variable
+# is for the person who reaches for --break-system-packages anyway: it puts the
+# result in this app's directory instead of a shared dotfile.
+export PYTHONUSERBASE="${PYTHONUSERBASE:-${PERSIST_DIR}/python}"
+
 # --- the X and ICE authority files, which are not XDG ----------------------
 #
 # .ICEauthority appeared in $HOME in the measurement above; libICE reads
@@ -309,38 +329,93 @@ export XAUTHORITY="${XAUTHORITY:-${STATE_DIR}/Xauthority}"
 # The socket lives in XDG_RUNTIME_DIR, which is under /tmp.
 export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
 
-# --- the XDG user directories ---------------------------------------------
+# --- the XDG user directories ---
 #
 # /etc/xdg/user-dirs.conf in the image sets enabled=False, which stops
-# xdg-user-dirs-update from creating the eight directories. This pins what the
-# READERS see: GTK's file chooser, Thunar's sidebar and xfdesktop's icon view
-# all resolve these names, and with no file they resolve to $HOME/Desktop,
-# $HOME/Documents and so on -- which xfdesktop would then create itself.
+# xdg-user-dirs-update from creating anything. Verified: with that file in place,
+# `xdg-user-dirs-update` in a home containing nothing leaves it containing
+# nothing.
 #
-# Only Desktop gets a real directory, inside this app's own persist directory,
-# because xfdesktop genuinely needs somewhere to put icons. Everything else
-# points at $HOME: the spec treats a user dir equal to $HOME as disabled, and
-# GTK hides those from its sidebar, so the entries vanish rather than pointing
-# somewhere wrong.
+# This pins what the READERS see: GTK's file chooser, Thunar's sidebar,
+# xfdesktop's icon view and every application that asks where "Downloads" is.
+# With no file at all they resolve to $HOME/Desktop, $HOME/Documents and so on,
+# and an application that decides to create its user directory then creates it
+# directly in a home shared with Casper and Derecho.
 #
-# Written only if absent. A user who has moved their own Downloads is the
-# authority on where it goes.
+# So all eight point inside this app's own directory, and all eight are created.
+# Every one of them is still on GLADE and still visible from Casper and Derecho
+# -- they are just under one predictable prefix instead of scattered across the
+# top of the home. Eight empty directories inside $HOME/cirrus-desktop is a
+# deliberate trade against eight of them in $HOME.
+#
+# An earlier version of this pointed the seven non-Desktop entries at $HOME,
+# which the spec treats as "disabled". That kept them out of the way but meant a
+# download landed loose in the home, so it is now the arrangement below.
+USER_DIRS_VERSION=2
 seed_user_dirs() {
-    local f="${XDG_CONFIG_HOME}/user-dirs.dirs"
-    [ -e "$f" ] && return 0
+    local f="${XDG_CONFIG_HOME}/user-dirs.dirs" marker key dir
+    marker="# cirrus-desktop user-dirs v"
+
+    if [ -e "$f" ]; then
+        # Ours to rewrite only if we wrote it and nobody has repointed anything.
+        # A file we did not write is the user's own and is never touched. A file
+        # we did write but whose values have been changed is a deliberate edit,
+        # and is also left alone.
+        #
+        # Two spellings count as ours. The current one carries the version
+        # marker; the first one did not carry a marker at all, and is recognised
+        # by the header it wrote instead -- without this, every session created
+        # before the marker existed would be treated as hand-written and would
+        # keep the old layout forever, which is precisely the case this upgrade
+        # is for.
+        if ! grep -q "^${marker}" "$f" 2>/dev/null \
+           && ! grep -q '^# Written by entrypoint.sh at first launch of the CIRRUS desktop\.$' "$f" 2>/dev/null; then
+            log "leaving your own ${f} alone"
+            return 0
+        fi
+        if grep -q "^${marker}${USER_DIRS_VERSION}\$" "$f" 2>/dev/null; then
+            return 0
+        fi
+        local value
+        while IFS= read -r value; do
+            case "$value" in
+                "$HOME"|"${PERSIST_DIR}"/*) ;;
+                *)  warn "${f} points a directory somewhere this app did not put it;"
+                    warn "leaving it as it is. Delete the file to get the current defaults."
+                    return 0 ;;
+            esac
+        done <<EOF
+$(sed -n 's/^XDG_[A-Z]*_DIR="\(.*\)"$/\1/p' "$f" 2>/dev/null)
+EOF
+        log "updating ${f} to the current layout (everything under ${PERSIST_DIR})"
+    fi
+
     mkdir -p -- "$XDG_CONFIG_HOME" 2>/dev/null || return 0
-    mkdir -p -- "${PERSIST_DIR}/Desktop" 2>/dev/null || true
     {
-        printf '# Written by entrypoint.sh at first launch of the CIRRUS desktop.\n'
-        printf '# Delete this file to have the desktop regenerate it.\n'
-        printf 'XDG_DESKTOP_DIR="%s/Desktop"\n' "$PERSIST_DIR"
-        # $HOME, i.e. "disabled" -- see the note above.
-        local key
-        for key in DOWNLOAD TEMPLATES PUBLICSHARE DOCUMENTS MUSIC PICTURES VIDEOS; do
-            printf 'XDG_%s_DIR="%s"\n' "$key" "$HOME"
+        printf '%s%s\n' "$marker" "$USER_DIRS_VERSION"
+        printf '# Written by entrypoint.sh. Every directory is inside this app own\n'
+        printf '# directory rather than loose in your home, which is shared with\n'
+        printf '# Casper and Derecho. Edit any path here and this file is left alone\n'
+        printf '# from then on; delete it to get these defaults back.\n'
+        # DESKTOP first because it is the one xfdesktop genuinely needs.
+        for key in DESKTOP:Desktop DOWNLOAD:Downloads DOCUMENTS:Documents \
+                   MUSIC:Music PICTURES:Pictures VIDEOS:Videos \
+                   TEMPLATES:Templates PUBLICSHARE:Public; do
+            dir="${key#*:}"
+            printf 'XDG_%s_DIR="%s/%s"\n' "${key%%:*}" "$PERSIST_DIR" "$dir"
         done
-    } > "$f" 2>/dev/null || warn "could not write ${f}; XFCE may create folders in your home"
-    log "pinned the XDG user directories in ${f} (Desktop -> ${PERSIST_DIR}/Desktop)"
+    } > "$f" 2>/dev/null || {
+        warn "could not write ${f}; XFCE may create folders in your home"
+        return 0
+    }
+
+    # Created, not left dangling: an application told its Downloads directory is
+    # somewhere that does not exist either creates it or fails, and which one it
+    # does is not worth finding out per application.
+    for key in Desktop Downloads Documents Music Pictures Videos Templates Public; do
+        mkdir -p -- "${PERSIST_DIR}/${key}" 2>/dev/null || true
+    done
+    log "XDG user directories pinned under ${PERSIST_DIR} (Desktop, Downloads, Documents, ...)"
 }
 seed_user_dirs
 
@@ -520,6 +595,7 @@ if [ "$MODE" = "bootstrap" ]; then
     log "  XDG_STATE_HOME   : ${XDG_STATE_HOME}"
     log "  XDG_RUNTIME_DIR  : ${XDG_RUNTIME_DIR}"
     log "  TMPDIR           : ${TMPDIR}"
+    log "  PYTHONUSERBASE   : ${PYTHONUSERBASE}"
     log "  ICEAUTHORITY     : ${ICEAUTHORITY}"
     log "  XAUTHORITY       : ${XAUTHORITY}"
     log "  session bus      : ${DBUS_SESSION_BUS_ADDRESS}"

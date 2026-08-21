@@ -9,7 +9,7 @@
   # summary carries the line to paste.
   #
   # NEEDS BUMPING. The tag below connects correctly (it carries the websocket
-  # path fix) but predates two more:
+  # path fix) but predates three more:
   #
   #   * the appearance. xfce4-settings ships an xsettings.xml naming Greybird
   #     and elementary-xfce-dark, both Recommends, so with
@@ -22,6 +22,17 @@
   #     blocks on a GTK dialog. GNOME Web is installed now (Firefox and Chromium
   #     are snap-only in the noble archive), along with GSK_RENDERER=cairo,
   #     without which a GTK4 window never maps on this X server.
+  #
+  #   * the self-help toolchain. There is no root in a session, so anything a
+  #     user needs beyond the image they install into their home - and the image
+  #     had no compiler, no pip (venv could not provision it) and no xz, so
+  #     most upstream tarballs could not even be unpacked. build-essential,
+  #     python3-dev/pip/venv and the archive tools are in now.
+  #
+  #   * the XDG user directories. All eight now resolve inside
+  #     $HOME/cirrus-desktop rather than seven of them pointing at $HOME, so a
+  #     download lands under this app's own directory instead of loose in a home
+  #     shared with Casper and Derecho. Existing sessions are upgraded in place.
   #
   # Re-run CI and pin the new tag.
   # ---------------------------------------------------------------------------

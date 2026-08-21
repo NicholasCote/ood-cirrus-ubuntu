@@ -311,7 +311,24 @@ Desktop  Documents  Downloads  Music  Pictures  Public  Templates  Videos
 Those eight bare directories are the worst of it. Nobody asked for them, they
 are visible from every login node forever, and one of them — `Desktop` — differs
 from this app's own directory only by case, which in a shared home is its own
-trap. **That is why the persist directory is `~/cirrus-desktop/` and not
+trap.
+
+If they are already in a home, this app is not necessarily what put them there:
+`enabled=False` has been in the image since its first build, and
+`xdg-user-dirs-update` under it leaves an empty home empty. GLADE is shared, so a
+GNOME session or an `xdg-user-dirs` run on Casper or Derecho will have done the
+same thing at some point. `stat -c '%y  %n' ~/Desktop ~/Documents ...` settles
+which. Removing them is deliberately not this app's business — nothing here
+deletes anything in a home it does not own, even an empty directory — but
+`rmdir` refuses a non-empty directory, so
+
+```bash
+for d in Desktop Documents Downloads Music Pictures Public Templates Videos; do
+    rmdir "$HOME/$d" 2>/dev/null && echo "removed empty ~/$d"
+done
+```
+
+is safe to run by hand. **That is why the persist directory is `~/cirrus-desktop/` and not
 `~/desktop`.** The entrypoint refuses a persist directory whose last component
 case-insensitively matches any of the eight, whoever set it.
 
@@ -331,7 +348,7 @@ Split between two destinations:
 | --- | --- |
 | `$HOME/cirrus-desktop/config/` | `XDG_CONFIG_HOME` — panel layout, theme, keyboard shortcuts, Thunar |
 | `$HOME/cirrus-desktop/data/` | `XDG_DATA_HOME` — application data, trash, recently-used |
-| `$HOME/cirrus-desktop/Desktop/` | the one XDG user dir that needs to be real |
+| `$HOME/cirrus-desktop/{Desktop,Downloads,Documents,Music,Pictures,Videos,Templates,Public}/` | the XDG user dirs |
 | `/tmp/cirrus-desktop/` | everything else: caches, runtime state, sockets, the session bus, the X and ICE authority files, the resolved password |
 
 ### The session bus is not started with `dbus-launch`
@@ -357,11 +374,35 @@ stderr like everything else.
 resolve these names, and with no file they resolve to `$HOME/Desktop`,
 `$HOME/Documents` and so on, which xfdesktop would then create itself.
 
-Only `XDG_DESKTOP_DIR` gets a real directory. The other seven point at `$HOME`,
-which the spec treats as "disabled" and GTK hides from its sidebar — so the
-entries vanish rather than pointing somewhere wrong. Written only if the file is
-absent: a user who has moved their own `Downloads` is the authority on where it
-goes.
+**All eight point inside `$HOME/cirrus-desktop/`, and all eight are created.**
+Every one is still on GLADE and still visible from Casper and Derecho — they are
+just under one predictable prefix instead of scattered across the top of the
+home. Eight empty directories inside the app's own directory is a deliberate
+trade against eight of them in `$HOME`.
+
+They are created rather than left dangling because an application told its
+Downloads directory is somewhere that does not exist either creates it or fails,
+and which one it does is not worth discovering per application.
+
+An earlier version pointed the seven non-Desktop entries at `$HOME` itself, which
+the spec treats as "disabled" and GTK hides from its sidebar. That kept them out
+of the way, but it meant a browser download landed loose in the home — so the
+arrangement above replaced it.
+
+The file carries a version marker, and rewriting it is conservative in three
+steps:
+
+* no file → write the current layout;
+* a file this app wrote, with every path still where this app put it → upgrade it
+  and say so in the log;
+* anything else — a file without our header, or one of ours with a path pointing
+  somewhere we would not have chosen — → left exactly as it is.
+
+The middle case matters more than it looks: the first version of that file
+carried no version marker at all, so it is recognised by the header text it wrote
+instead. Without that, every session created before the marker existed would be
+treated as hand-written and would keep the old layout forever — which is the
+exact population the upgrade is for. All three paths are covered by tests.
 
 ### What is deliberately *not* redirected
 
@@ -477,7 +518,7 @@ podman build -t localhost/cirrus-desktop:dev -f image/Dockerfile image
 image/test/acceptance.sh
 ```
 
-Last run, 45 checks, all passing:
+Last run, 52 checks, all passing:
 
 ```
 == 1. arbitrary uid, runtime-synthesised numeric passwd entry ==
@@ -519,6 +560,8 @@ Last run, 45 checks, all passing:
   contents: .bashrc .config .gitconfig .local .ssh_config_sample cirrus-desktop work 
   ok   $HOME/cirrus-desktop was created
   ok   none of the XDG user dirs, .cache, .dbus, .ICEauthority or .config/xfce4 in $HOME
+  ok   all eight XDG user dirs resolve under $HOME/cirrus-desktop
+  ok   all eight exist inside $HOME/cirrus-desktop
   ok   nothing new anywhere outside $HOME/cirrus-desktop
   ok   every pre-existing file is byte-identical (md5)
 == 9. idle watchdog ==
@@ -537,7 +580,13 @@ Last run, 45 checks, all passing:
   ok   exo-open --launch WebBrowser returns (it blocks on a dialog with no browser)
   ok   xdg-open exists (what GTK apps and terminals actually call)
   ok   GSK_RENDERER=cairo is set (GTK4 windows map without DRI3)
-== 12. versions recorded in the image ==
+== 12. a user can install things without root ==
+  ok   archive tools, compiler and pip are all present
+  ok   tar round-trips gzip, bzip2 and xz archives
+  ok   gcc compiles and the result runs, as the unprivileged session uid
+  ok   python3 -m venv builds a working venv with pip in it
+  ok   the session's PYTHONUSERBASE is inside $HOME/cirrus-desktop (/home/ncote/cirrus-desktop/python)
+== 13. versions recorded in the image ==
   ok   desktop-versions --check agrees with the record
 ```
 
@@ -788,6 +837,101 @@ the icon theme's `index.theme`, every theme it inherits from, the cursor theme's
 `cursors/`, the interface font family, and every `Exec=` behind every launcher on
 the default panel.
 
+## Installing things yourself, without root
+
+There is no root in this session and there cannot be: the pod runs as the user's
+own uid so files written to GLADE belong to them. Measured:
+
+```
+$ apt-get install -y cowsay
+E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied)
+E: Unable to acquire the dpkg frontend lock, are you root?
+```
+
+Writable paths are **`/tmp`, `/var/tmp` and `$HOME`** — `/usr`, `/usr/local`,
+`/opt`, `/var` and `/etc` are all read-only.
+
+The image therefore carries the tools that make "install it in your home"
+actually workable. Each one closes a dead end that was measured in the image
+before it was added:
+
+| | closes |
+| --- | --- |
+| `xz-utils` `bzip2` `zstd` `unzip` | `tar -J` and `tar -j` both **failed** — the image had `gzip` and nothing else, and most upstream releases ship `.tar.xz`. (`dpkg -x` was always fine; `dpkg-deb` links liblzma itself.) |
+| `wget` | a great many install scripts assume it |
+| `python3-pip` `python3-venv` | `python3 -m venv` **failed**: Debian strips `ensurepip`, so venv could not provision pip and there was no pip to fall back on |
+| `build-essential` `python3-dev` | no compiler at all. `python3-dev` comes with it rather than after it — pip building any C extension fails on a missing `Python.h`, which is a confusing error to hit when a compiler is demonstrably present |
+
+72 MB of download, 66 MB of it the compiler; the image goes from 979 MB to
+1.26 GB. Weigh that against a session where the answer to "can I install X" is
+no.
+
+### Python: use a venv
+
+Ubuntu 24.04 marks the system Python externally managed, so PEP 668 refuses the
+obvious thing:
+
+```
+$ pip3 install --user six
+error: externally-managed-environment
+```
+
+A virtual environment is the supported route and works normally:
+
+```bash
+python3 -m venv ~/cirrus-desktop/venv
+~/cirrus-desktop/venv/bin/pip install <whatever>
+```
+
+`PYTHONUSERBASE` is pointed at `~/cirrus-desktop/python` for the person who
+reaches for `--break-system-packages` anyway. Left at its default,
+`pip install --user` writes to `$HOME/.local/lib/python3.12/site-packages`,
+which **any Python of the same minor version on Casper and Derecho imports** —
+and a compiled extension built here would then be picked up there and fail
+somewhere else entirely. Same hazard as the R library in the sibling RStudio app.
+
+### ⚠️ Anything you build here is this container's
+
+glibc is **2.39** on Ubuntu 24.04. `$HOME` is GLADE, shared with Casper and
+Derecho. A binary compiled in this container will generally **not** run on those
+systems, nor the reverse, and unlike the R library there is no hook that can
+catch it for a compiler. Build into `~/cirrus-desktop/` and treat the result as
+belonging to this image.
+
+### What is still possible with apt
+
+`apt` works for everything except the final install step. Redirect its state
+somewhere writable and it will even resolve the dependency closure:
+
+```bash
+APT="apt-get -o Dir::State::Lists=/tmp/apt/lists -o Dir::Cache::Archives=/tmp/apt/cache/archives"
+mkdir -p /tmp/apt/lists/partial /tmp/apt/cache/archives/partial
+$APT update
+$APT install -s --no-install-recommends <pkg>     # prints the "Inst" closure
+$APT download <the closure>
+for d in *.deb; do dpkg -x "$d" ~/cirrus-desktop/local; done
+```
+
+Extraction gives files, not an install, so the program then has to be told where
+its pieces are — either through the environment variables it documents
+(`PATH`, `LD_LIBRARY_PATH`, `PERL5LIB`, …) or by grafting the tree over the real
+prefixes:
+
+```bash
+bwrap --dev-bind / / --bind ~/cirrus-desktop/local/usr/lib/... /usr/lib/... <program>
+```
+
+Unprivileged user namespaces are available (`unshare -Ur` gives uid 0,
+`max_user_namespaces` is unlimited), which is what makes that `bwrap` work — and
+what WebKit's sandbox is already using. Two limits found by trying: `bwrap` can
+only bind **over a path that already exists**, and unprivileged **overlayfs is
+refused**, so there is no way to get a writable-but-populated `/usr` and run apt
+for real. `apt -o RootDir=` fights its own path handling and is not worth it.
+
+For anything durable or shared, the right answer remains `image/Dockerfile` plus
+a CI run: real dependency resolution, reproducible, and it stays out of the
+shared home.
+
 ## What is installed, and what is not
 
 XFCE core — session, window manager, panel, desktop, settings — plus
@@ -797,11 +941,15 @@ Appearance: `yaru-theme-gtk`, `yaru-theme-icon`, `humanity-icon-theme`,
 `adwaita-icon-theme`, `fonts-ubuntu`, `fonts-dejavu-core`. And
 `epiphany-browser` plus `xdg-utils`, so that clicking a URL does something.
 
-Roughly 980 MB: about 145 MB of that is theme and fonts, and about 200 MB is the
-browser and WebKit. Both are one-time pulls per node, cached by Harbor. To drop
-the browser, remove `epiphany-browser` and `xdg-utils` from the Dockerfile — and
-leave the panel default without a browser launcher, because the two go
-together.
+And the self-help toolchain above: `build-essential`, `python3-dev`,
+`python3-pip`, `python3-venv`, `xz-utils`, `bzip2`, `zstd`, `unzip`, `wget`.
+
+Roughly **1.26 GB**: about 145 MB theme and fonts, about 200 MB browser and
+WebKit, and about 280 MB compiler and toolchain. All one-time pulls per node,
+cached by Harbor. To drop the browser, remove `epiphany-browser` and `xdg-utils`
+— and leave the panel default without a browser launcher, because the two go
+together. To drop the toolchain, `build-essential` and `python3-dev` are 66 MB of
+the 72 MB download on their own.
 
 That is the deliberate scope: the reason to open a desktop here is to look at
 and manipulate files on GLADE, and everything beyond that a user brings from

@@ -165,6 +165,53 @@ ENV CIRRUS_DESKTOP_HOME=/opt/cirrus-desktop
 # So the approach is XFCE wearing Ubuntu's GNOME theme, which is the look without
 # the login manager and the GL compositor.
 #
+# ---------------------------------------------------------------------------
+# Letting a user help themselves.
+#
+# There is no root in this session and there cannot be: the pod runs as the
+# user's own uid so that files written to GLADE belong to them, and /usr, /opt,
+# /var and /etc are all read-only. Measured:
+#   $ apt-get install -y cowsay
+#   E: Could not open lock file /var/lib/dpkg/lock-frontend - open (13: Permission denied)
+#   E: Unable to acquire the dpkg frontend lock, are you root?
+# Only /tmp, /var/tmp and $HOME are writable.
+#
+# So whatever a user needs beyond this image, they install into their home - and
+# the packages below are what makes that possible at all rather than merely
+# theoretically possible. Each one closes a specific dead end that was measured
+# in the image without it:
+#
+# xz-utils      tar could not read a .tar.xz, which is how most upstream
+# bzip2         releases ship. The image had gzip and nothing else: `tar -J`
+# zstd          and `tar -j` both failed outright. Note dpkg -x was always fine
+# unzip         - dpkg-deb links liblzma itself - so this was specifically about
+#               source tarballs and release archives.
+# wget          because a great many install scripts assume it. curl was already
+#               here; this is one package and it removes a class of "command not
+#               found" halfway through somebody else's shell script.
+#
+# python3-pip   `python3 -m venv` FAILED in this image: Debian strips ensurepip,
+# python3-venv  so venv could not provision pip and there was no pip to fall
+#               back on. Two packages, and the whole Python ecosystem opens up.
+#
+# build-essential
+# python3-dev   A compiler, because "install it yourself" without one means
+#               "only if somebody shipped you a binary". python3-dev comes with
+#               it rather than after it: pip building any package with a C
+#               extension fails on a missing Python.h, which is a confusing
+#               error to hit when a compiler is demonstrably present.
+#
+# 72 MB of download for the set, 66 MB of that the compiler. Weigh that against
+# a session where the answer to "can I install X" is no.
+#
+# IMPORTANT, and it applies to everything built here: this is glibc 2.39 on
+# Ubuntu 24.04. $HOME is GLADE, shared with Casper and Derecho, and a binary
+# compiled in this container will generally NOT run on those systems - nor the
+# reverse. It is the same hazard the sibling RStudio app's R library isolation
+# exists to prevent, and there is no equivalent hook to catch it for a compiler.
+# Build into $HOME/cirrus-desktop/ and treat the result as this container's.
+# ---------------------------------------------------------------------------
+
 # epiphany-browser
 # xdg-utils      A browser, because without one the desktop has a control that
 #                fails. XFCE's stock panel ships a Web Browser launcher running
@@ -211,9 +258,18 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
         openssh-client \
         procps \
         python3 \
+        python3-dev \
+        python3-pip \
+        python3-venv \
+        unzip \
+        wget \
         xauth \
+        xz-utils \
+        zstd \
         xdg-user-dirs \
         adwaita-icon-theme \
+        bzip2 \
+        build-essential \
         fonts-dejavu-core \
         fonts-ubuntu \
         humanity-icon-theme \
@@ -349,6 +405,9 @@ RUN set -eu; \
       printf 'python3\t%s\n'     "$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"; \
       printf 'git\t%s\n'         "$(git --version | awk '{print $3}')"; \
       printf 'epiphany\t%s\n'    "$(dpkg-query -W -f='${Version}' epiphany-browser)"; \
+      printf 'gcc\t%s\n'         "$(gcc -dumpfullversion)"; \
+      printf 'glibc\t%s\n'       "$(ldd --version | head -1 | awk '{print $NF}')"; \
+      printf 'pip\t%s\n'         "$(pip3 --version | awk '{print $2}')"; \
     } > "${CIRRUS_DESKTOP_HOME}/versions.txt"; \
     lib="$(ldconfig -p | awk -F'=> ' '/libnss_wrapper/ {print $2; exit}' | tr -d ' ')"; \
     if [ -z "$lib" ] || [ ! -r "$lib" ]; then \

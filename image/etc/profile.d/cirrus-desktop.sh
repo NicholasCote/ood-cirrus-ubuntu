@@ -21,5 +21,8 @@ fi
 if [ -n "${CIRRUS_DESKTOP_PERSIST_DIR:-}" ] && [ -d "${CIRRUS_DESKTOP_PERSIST_DIR}" ]; then
     : "${XDG_CONFIG_HOME:=${CIRRUS_DESKTOP_PERSIST_DIR}/config}"
     : "${XDG_DATA_HOME:=${CIRRUS_DESKTOP_PERSIST_DIR}/data}"
-    export XDG_CONFIG_HOME XDG_DATA_HOME
+    # Keeps `pip install --user` out of $HOME/.local, which is imported by any
+    # Python of the same minor version on Casper and Derecho.
+    : "${PYTHONUSERBASE:=${CIRRUS_DESKTOP_PERSIST_DIR}/python}"
+    export XDG_CONFIG_HOME XDG_DATA_HOME PYTHONUSERBASE
 fi

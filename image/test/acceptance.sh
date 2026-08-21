@@ -421,6 +421,33 @@ done
     && ok "none of the XDG user dirs, .cache, .dbus, .ICEauthority or .config/xfce4 in \$HOME" \
     || bad "the session wrote into the shared home:${strays}"
 
+# The positive half of the same property: it is not enough that the eight names
+# are absent from $HOME, they have to resolve to somewhere deliberate. With no
+# user-dirs.dirs at all they resolve to $HOME/Desktop, $HOME/Documents and so on,
+# and the first application to decide it wants its Downloads directory creates it
+# there. Asked through xdg-user-dir, which is what applications actually call.
+strays=""
+for key in DESKTOP DOWNLOAD DOCUMENTS MUSIC PICTURES VIDEOS TEMPLATES PUBLICSHARE; do
+    got=$(podman exec "$NAME" bash -c "HOME=/home/ncote XDG_CONFIG_HOME=/home/ncote/cirrus-desktop/config xdg-user-dir $key")
+    case "$got" in
+        /home/ncote/cirrus-desktop/*) ;;
+        *) strays="${strays} ${key}=${got}" ;;
+    esac
+done
+[ -z "$strays" ] \
+    && ok "all eight XDG user dirs resolve under \$HOME/cirrus-desktop" \
+    || bad "XDG user dir(s) resolving outside \$HOME/cirrus-desktop:${strays}"
+
+# And they exist, because an application told to use a directory that is not
+# there either creates it or fails, and which one is per application.
+missing=""
+for d in Desktop Downloads Documents Music Pictures Videos Templates Public; do
+    podman exec "$NAME" test -d "/home/ncote/cirrus-desktop/$d" || missing="${missing} ${d}"
+done
+[ -z "$missing" ] \
+    && ok "all eight exist inside \$HOME/cirrus-desktop" \
+    || bad "not created:${missing}"
+
 # The whole-tree comparison, which catches anything the named list above missed.
 podman exec "$NAME" bash -c 'cd /home/ncote && find . -path ./cirrus-desktop -prune -o -print | sort' \
     > "$WORK/home-after.list"
@@ -563,7 +590,73 @@ gsk=$(podman exec "$NAME" bash -c 'printf %s "${GSK_RENDERER:-}"')
     && ok "GSK_RENDERER=cairo is set (GTK4 windows map without DRI3)" \
     || bad "GSK_RENDERER is '${gsk:-unset}'; a GTK4 window will silently never appear"
 
-head_ "12. versions recorded in the image"
+head_ "12. a user can install things without root"
+# There is no root in this session and cannot be. Everything a user needs beyond
+# this image they install into their home, so the tools that makes possible are
+# part of the contract -- and each check below is a dead end that was measured in
+# the image before the package was added.
+missing=""
+for c in gzip bzip2 xz zstd unzip wget gcc make pip3; do
+    podman exec "$NAME" bash -c "command -v $c >/dev/null" || missing="${missing} ${c}"
+done
+[ -z "$missing" ] && ok "archive tools, compiler and pip are all present" \
+                  || bad "missing:${missing}"
+
+# tar specifically, because the image had gzip and nothing else and most upstream
+# releases ship .tar.xz -- `tar -J` failed outright.
+badtar=""
+for f in z j J; do
+    podman exec "$NAME" bash -c "
+        d=\$(mktemp -d); echo hi > \$d/f
+        tar -c${f}f \$d/a.tar -C \$d f 2>/dev/null && tar -t${f}f \$d/a.tar >/dev/null 2>&1" \
+        || badtar="${badtar} -${f}"
+done
+[ -z "$badtar" ] && ok "tar round-trips gzip, bzip2 and xz archives" \
+                 || bad "tar cannot handle:${badtar}"
+
+# The compiler as the SESSION uid, not as root at build time.
+if podman exec "$NAME" bash -c '
+      d=$(mktemp -d) && cd "$d" || exit 1
+      printf "int main(void){return 42;}\n" > t.c
+      gcc -O2 -o t t.c 2>/dev/null || exit 1
+      ./t; [ $? -eq 42 ]'; then
+    ok "gcc compiles and the result runs, as the unprivileged session uid"
+else
+    bad "gcc could not build and run a binary as the session uid"
+fi
+
+# A venv is the supported route for Python packages: Ubuntu 24.04 marks the
+# system Python externally managed, so `pip install --user` is refused by PEP 668
+# ("error: externally-managed-environment"). Without python3-venv this silently
+# failed, because Debian strips ensurepip and there was no pip to fall back on.
+if podman exec "$NAME" bash -c '
+      d=$(mktemp -d) && python3 -m venv "$d/v" >/dev/null 2>&1         && "$d/v/bin/pip" --version >/dev/null 2>&1'; then
+    ok "python3 -m venv builds a working venv with pip in it"
+else
+    bad "python3 -m venv cannot provision pip (python3-venv missing?)"
+fi
+
+# And if someone forces --user past PEP 668, it must not land in $HOME/.local,
+# which any Python of the same minor version on Casper and Derecho imports.
+#
+# Read from the LIVE SESSION's environment, not from a `podman exec` shell. That
+# distinction cost a false failure: an exec gets the image's ENV plus what the
+# runtime injects, and none of the entrypoint's runtime exports -- so this read
+# as unset while the desktop had it correctly. What the desktop's own processes
+# see is the thing that matters, since every terminal and every application is a
+# child of that session. Same technique the sibling RStudio app uses to check
+# what rsession inherited.
+pub=$(podman exec "$NAME" bash -c '
+    pid=$(pgrep -x xfce4-session | head -1) || exit 1
+    [ -n "$pid" ] || exit 1
+    tr "\0" "\n" < /proc/$pid/environ | sed -n "s/^PYTHONUSERBASE=//p"' 2>/dev/null)
+case "$pub" in
+    */cirrus-desktop/*) ok "the session's PYTHONUSERBASE is inside \$HOME/cirrus-desktop (${pub})" ;;
+    "")                 bad "could not read the XFCE session's environment" ;;
+    *)                  bad "the session's PYTHONUSERBASE is '${pub}'; --user would write to a shared dotfile" ;;
+esac
+
+head_ "13. versions recorded in the image"
 podman run --rm -e CIRRUS_DESKTOP_AUTH=none "$IMAGE" bootstrap desktop-versions 2>/dev/null \
     | grep -v '^#' | sed 's/^/  /'
 if podman run --rm -e CIRRUS_DESKTOP_AUTH=none "$IMAGE" bootstrap desktop-versions --check >/dev/null 2>&1; then
