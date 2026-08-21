@@ -56,9 +56,14 @@ Design notes
   on the handshake like any other request, so the handshake is checked exactly
   like a GET.
 
+* It injects one query parameter into the document request, and that is the
+  only place the proxy prefix is handed to the client. See "The websocket path"
+  below -- it is the difference between a desktop that paints and one that shows
+  the client and then fails to connect.
+
 * It never rewrites a body, and it deliberately does not put the proxy prefix
-  into anything the proxy handles itself. OnDemand's /rnode/ block does both
-  halves:
+  into anything else the proxy handles itself. OnDemand's /rnode/ block does
+  both halves:
 
       Header edit Location "^([^/]+//[^/]+)|(?=/)|^([\./]{1,}(?<!/))" \
                            "/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
@@ -73,8 +78,49 @@ Design notes
 
   What the proxy does NOT rewrite is response bodies. The login form's action is
   in a body, and the browser resolves it against the OnDemand host, so that one
-  string does need the full prefix -- and that is the only reason
-  CIRRUS_DESKTOP_ROOT_PATH exists.
+  string does need the full prefix.
+
+The websocket path
+------------------
+The client's own websocket URL is the one thing in KasmVNC that is NOT
+prefix-agnostic, and it is worth being precise about because the symptom is
+misleading: the page loads perfectly and then reports a failed connection.
+
+Every asset reference in the client is relative, and `host`, `port` and
+`encrypt` are all taken from window.location -- so all of those survive the
+proxy. But the URL is assembled root-absolutely from a `path` setting whose
+default is the bare string "websockify" (read out of the bundle in this image):
+
+    a = o.getSetting("encrypt") ? "wss" : "ws";
+    a += "://" + t;          // window.location.hostname
+    r && (a += ":" + r);     // window.location.port, or 443/80
+    a += "/" + i;            // o.getSetting("path"), default "websockify"
+
+Behind /rnode/ that produces wss://ondemand.ucar.edu/websockify -- the
+/rnode/<node>/<port> prefix is simply gone, and the handshake goes to the
+OnDemand dashboard's own root instead of to this pod.
+
+The settings resolver is what makes this fixable from here. From the same
+bundle:
+
+    function hr(n,e){ const t = IA(n); return t===null ? CA(n,e) : t }
+    function Zb(n,e){ Mr[n] = e }
+
+`hr` checks a URL query parameter FIRST and only then localStorage or the
+default, and `Zb` -- what initSetting uses to record the resolved value -- writes
+to an in-memory map, not to localStorage. So a `?path=` parameter wins over
+everything and persists nothing: a stale value from an earlier session, which
+would carry an earlier session's NodePort, cannot win over the one supplied
+here.
+
+So a GET for the client document with no `path=` of its own is answered with a
+302 to the same document carrying `path=<prefix>websockify`. Root-relative and
+unprefixed as always, so the proxy prepends the prefix to the Location. Done on
+every document request rather than only after sign-in, so a reload gets the
+right value too rather than reverting to the default.
+
+CIRRUS_DESKTOP_ROOT_PATH therefore has two consumers: this, and the login form's
+action.
 """
 
 import base64
@@ -264,6 +310,53 @@ def signin_target(raw):
 
 SIGNIN_URL = normalised_root() + SIGNIN_PATH
 
+# The documents that load the VNC client, and therefore the ones that need the
+# websocket path handed to them. screen.html is the secondary-monitor window,
+# which the client opens itself with a pathname-derived URL -- correctly
+# prefixed, but with no `path` of its own, so it needs the same treatment.
+CLIENT_DOCUMENTS = ("/", "/index.html", "/vnc.html", "/screen.html")
+
+
+def websocket_path():
+    """The `path` setting the client needs, relative to the websocket root.
+
+    No leading slash: the client builds its URL as scheme://host[:port] + "/" +
+    path, so a leading slash here produces a doubled one.
+    """
+    return normalised_root().lstrip("/") + "websockify"
+
+
+def needs_path_param(method, target):
+    """Should this request be answered with a redirect that adds `path`?"""
+    if method != "GET":
+        return False
+    path, _, query = target.partition("?")
+    if path not in CLIENT_DOCUMENTS:
+        return False
+    # Nothing to fix when the app really is at the root -- a direct connection,
+    # a port-forward, the acceptance test. "websockify" is already the default.
+    if websocket_path() == "websockify":
+        return False
+    # Already carries one, whoever put it there. Redirecting again would loop.
+    return "path" not in urllib.parse.parse_qs(query, keep_blank_values=True)
+
+
+def with_path_param(target):
+    path, _, query = target.partition("?")
+    # safe="/" so the slashes in the prefix stay readable in the URL bar rather
+    # than becoming %2F, which is also what the client expects to read back.
+    addition = "path=" + urllib.parse.quote(websocket_path(), safe="/")
+    query = (query + "&" + addition) if query else addition
+    return path + "?" + query
+
+
+def redirect_response(location):
+    return http_response(
+        "302 Found",
+        '<a href="%s">Ubuntu Desktop</a>' % location,
+        ("Location: %s" % location,),
+    )
+
 
 def is_signin_request(path):
     """Does this request target the sign-in endpoint?
@@ -370,6 +463,12 @@ def handle(client, addr):
         action = SIGNIN_URL
 
         if has_valid_cookie(headers):
+            # The client document needs to be told the proxy prefix, because the
+            # one URL it does not build relatively is the websocket. See "The
+            # websocket path" in the module docstring.
+            if needs_path_param(method, path):
+                client.sendall(redirect_response(with_path_param(path)))
+                return
             password = read_password()
             if not password:
                 # The password file has gone. Refusing is the only honest
@@ -398,6 +497,11 @@ def handle(client, addr):
                 # the cookie to this session and to nothing else on the OnDemand
                 # host; setting that prefix here instead gets it applied twice.
                 redirect = signin_target((fields.get("to") or [""])[0])
+                # Carry the websocket path straight away, so the ordinary
+                # Connect-button flow does not need the extra redirect that a
+                # bare reload would take.
+                if needs_path_param("GET", redirect):
+                    redirect = with_path_param(redirect)
                 cookie_path = "/"
                 log("sign-in accepted from %s" % (addr[0],))
                 client.sendall(

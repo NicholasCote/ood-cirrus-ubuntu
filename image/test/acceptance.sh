@@ -181,10 +181,16 @@ COOKIE=$(printf '%s\n' "$hdrs" | grep -i '^set-cookie:' | sed 's/.*: //; s/;.*//
 # prefix to every Location it forwards, so a prefixed one arrives at the browser
 # doubled -- /rnode/<node>/<port>/rnode/<node>/<port>/ -- which is a 404 on the
 # dashboard.
+# The requirement is that it is UNPREFIXED, not that it is literally "/": the
+# gate also carries the websocket path parameter here so the ordinary Connect
+# flow needs no second redirect. What must never appear is the /rnode/ prefix,
+# which the proxy would then apply a second time.
 loc=$(printf '%s\n' "$hdrs" | grep -i '^location:' | sed 's/.*: //')
-[ "$loc" = "/" ] \
-    && ok "sign-in redirects to '/', unprefixed, so the proxy's rewrite lands on ${PREFIX}/" \
-    || bad "sign-in redirect is '${loc}', expected '/' (a prefix here gets applied twice)"
+case "$loc" in
+    "${PREFIX}"*) bad "sign-in redirect '${loc}' already carries the prefix; the proxy doubles it" ;;
+    /\?path=*|/)  ok "sign-in redirects to '${loc}', unprefixed, so the proxy's rewrite lands under ${PREFIX}/" ;;
+    *)            bad "sign-in redirect is '${loc}', expected an unprefixed root path" ;;
+esac
 
 head_ "6. what the proxy will do to what KasmVNC emits"
 # KasmVNC emits exactly one kind of Location: a trailing-slash 301 on a
@@ -209,17 +215,22 @@ else
     bad "GET /app sent no Location; the trailing-slash redirect has changed"
 fi
 
+# The client document, fetched the way the browser ends up fetching it: with the
+# websocket path parameter the gate injects. Without it the gate answers 302, so
+# every check below that reads the page has to come after this.
+DOC="/?path=${PREFIX#/}/websockify"
+
 # Any Authorization the client sends must be dropped, not honoured. Every
 # browser that another session on this OnDemand host has ever prompted holds a
 # stale Basic credential for this origin, and KasmVNC reads the first one.
 code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" -H "Cookie: ${COOKIE}" \
-        -u "wrong:wrong" "http://127.0.0.1:${PORT}/")
+        -u "wrong:wrong" "http://127.0.0.1:${PORT}${DOC}")
 [ "$code" = "200" ] \
     && ok "a stale client Authorization header is replaced, not forwarded (200)" \
     || bad "a bogus client Authorization broke the request (${code})"
 
 code=$(curl -s -o "$WORK/index.html" -w '%{http_code}' -A "$UA" -H "Cookie: ${COOKIE}" \
-        "http://127.0.0.1:${PORT}/")
+        "http://127.0.0.1:${PORT}${DOC}")
 [ "$code" = "200" ] && ok "the KasmVNC client page loads through the gate (200)" \
                     || bad "client page: got ${code}"
 # Root-absolute references are the one thing that cannot survive being served at
@@ -229,15 +240,47 @@ abs=$(grep -oE '(src|href)="/[^"]*"' "$WORK/index.html" | sort -u | tr '\n' ' ')
 [ -z "$abs" ] \
     && ok "the client page references no root-absolute asset (safe to serve at /)" \
     || bad "root-absolute references the proxy will not rewrite: ${abs}"
-# The websocket URL and the secondary-monitor URL are both built from
-# window.location.pathname, which is what makes a stripped prefix invisible to
-# the client. A KasmVNC release that hardcoded a path would break silently.
+# host, port and encrypt come from window.location, so they survive the proxy.
 js=$(grep -oE 'assets/[A-Za-z0-9._-]+\.js' "$WORK/index.html" | head -1)
-if [ -n "$js" ] && podman exec "$NAME" grep -q 'window.location.pathname' "/usr/share/kasmvnc/www/${js}"; then
-    ok "the client derives its URLs from window.location.pathname"
+if [ -n "$js" ] && podman exec "$NAME" \
+       grep -q 'initSetting("host",window.location.hostname)' "/usr/share/kasmvnc/www/${js}"; then
+    ok "the client reads host/port from window.location (survives the proxy)"
 else
-    bad "the client bundle no longer references window.location.pathname"
+    bad "the client no longer reads its host from window.location"
 fi
+
+# The websocket URL does NOT. It is assembled root-absolutely from a `path`
+# setting whose default is the bare string "websockify", which behind /rnode/
+# asks for wss://<ondemand host>/websockify and loses the prefix entirely. This
+# asserts the construction is still what the gate's injection compensates for --
+# if upstream ever makes it relative, the injection should be revisited rather
+# than left in place forever.
+if [ -n "$js" ] && podman exec "$NAME" \
+       grep -q 'initSetting("path","websockify")' "/usr/share/kasmvnc/www/${js}"; then
+    ok "the client still defaults its websocket path to a bare 'websockify'"
+else
+    note "the client's default websocket path has changed; re-read the gate's injection"
+fi
+
+# So the gate has to hand the prefix to the document. Unprefixed Location as
+# always -- the proxy prepends.
+red=$(curl -s -D - -o /dev/null -A "$UA" -H "Cookie: ${COOKIE}" "http://127.0.0.1:${PORT}/" | tr -d '\r')
+status=$(printf '%s\n' "$red" | head -1)
+loc=$(printf '%s\n' "$red" | grep -i '^location:' | sed 's/.*: //')
+case "${status}|${loc}" in
+    *302*"|/?path=${PREFIX#/}/websockify")
+        ok "the document is redirected to '${loc}' so the client learns the prefix" ;;
+    *)  bad "expected a 302 to /?path=${PREFIX#/}/websockify, got '${status}' '${loc}'" ;;
+esac
+
+# And it must not loop: once the parameter is there the request is proxied. That
+# is the ${DOC} fetch above, which returned 200 -- restated here because "no
+# infinite redirect" is the property, not an incidental fact about one fetch.
+code=$(curl -s -o /dev/null -w '%{http_code}' -A "$UA" -H "Cookie: ${COOKIE}" \
+        "http://127.0.0.1:${PORT}${DOC}")
+[ "$code" = "200" ] \
+    && ok "a document that already carries path= is served, not redirected again" \
+    || bad "the path= injection loops (${code})"
 
 head_ "7. websocket upgrade with a foreign Origin, and the desktop behind it"
 # Not a 101 and a hope: this completes the RFB 3.8 handshake through the gate
@@ -246,8 +289,12 @@ head_ "7. websocket upgrade with a foreign Origin, and the desktop behind it"
 cat > "$WORK/rfb.py" <<'PY'
 import base64, hashlib, os, socket, struct, sys, time
 PORT = int(sys.argv[1]); COOKIE = sys.argv[2]; HOLD = float(sys.argv[3])
+# The request path is an argument on purpose. Writing "/websockify" here by hand
+# is exactly how the client's own root-absolute URL construction was missed: the
+# probe connected to a path the real client never asks for.
+WSPATH = sys.argv[4] if len(sys.argv) > 4 else "/websockify"
 key = base64.b64encode(os.urandom(16)).decode()
-req = (f"GET /websockify HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nUpgrade: websocket\r\n"
+req = (f"GET {WSPATH} HTTP/1.1\r\nHost: 127.0.0.1:{PORT}\r\nUpgrade: websocket\r\n"
        f"Connection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
        "Sec-WebSocket-Protocol: binary\r\nOrigin: https://ondemand.ucar.edu\r\n"
        "User-Agent: Mozilla/5.0 Chrome/140\r\n")
@@ -324,12 +371,25 @@ px = rd(rw * rh * (pf[0] // 8))
 print("DESKTOP %dx%d depth=%d name=%s rects=%d pixelbytes=%d" % (w, h, pf[1], name, nrects, len(px)))
 if HOLD: time.sleep(HOLD)
 PY
-out=$(python3 "$WORK/rfb.py" "$PORT" "" 0 2>&1 | head -1)
+# The path is derived, not written: take what the gate told the client to use,
+# build the URL the way the client does, then strip the prefix the way
+# OnDemand's /rnode/ RewriteRule does. Whatever is left is what the pod must
+# answer on. Writing "/websockify" here by hand is what hid the bug that this
+# whole injection exists to fix.
+client_path=$(printf '%s\n' "$loc" | sed -n 's/.*[?&]path=\([^&]*\).*/\1/p')
+client_url="/${client_path}"                         # scheme://host + "/" + path
+stripped="${client_url#${PREFIX}}"                   # what /rnode/ forwards
+printf '  client would open ws://<host>%s ; the proxy forwards %s\n' "$client_url" "$stripped"
+[ "$stripped" = "/websockify" ] \
+    && ok "the client-computed path arrives at the pod as /websockify" \
+    || bad "the client-computed path arrives as '${stripped}', which the pod does not serve"
+
+out=$(python3 "$WORK/rfb.py" "$PORT" "" 0 "$stripped" 2>&1 | head -1)
 case "$out" in
     NOUPGRADE*) ok "no cookie: refused, no upgrade (${out#NOUPGRADE })" ;;
     *)          bad "no cookie: the gate upgraded anyway (${out})" ;;
 esac
-out=$(python3 "$WORK/rfb.py" "$PORT" "$COOKIE" 0 2>&1)
+out=$(python3 "$WORK/rfb.py" "$PORT" "$COOKIE" 0 "$stripped" 2>&1)
 printf '%s\n' "$out" | grep -q '^UPGRADED HTTP/1.1 101' \
     && ok "with the session cookie: 101, valid Sec-WebSocket-Accept, foreign Origin" \
     || bad "with the cookie: $(printf '%s' "$out" | head -1)"
@@ -393,7 +453,14 @@ for _ in $(seq 1 120); do
 done
 livecookie=$(curl -s -D - -o /dev/null -X POST -d "password=${PASSWORD}" \
     "http://127.0.0.1:$((PORT+1))/cirrus-signin" | tr -d '\r' | grep -i '^set-cookie:' | sed 's/.*: //; s/;.*//')
-python3 "$WORK/rfb.py" "$((PORT+1))" "$livecookie" 45 >/dev/null 2>&1 &
+# No BASE_URL file on this container, so it has no prefix -- and with nothing to
+# fix the gate must NOT redirect, or a direct connection would loop.
+livecode=$(curl -s -o /dev/null -w '%{http_code}' -H "Cookie: ${livecookie}" \
+            "http://127.0.0.1:$((PORT+1))/")
+[ "$livecode" = "200" ] \
+    && ok "with no proxy prefix the document is served directly, not redirected" \
+    || bad "no-prefix document got ${livecode}, expected 200"
+python3 "$WORK/rfb.py" "$((PORT+1))" "$livecookie" 45 /websockify >/dev/null 2>&1 &
 holder=$!
 sleep 40
 state=$(podman inspect "${NAME}-live" --format '{{.State.Status}}' 2>/dev/null)

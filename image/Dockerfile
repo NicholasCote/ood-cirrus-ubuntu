@@ -34,10 +34,24 @@
 #       GET /websockify with it, Origin: https://ondemand.ucar.edu            -> 101
 #
 #   * Its own HTML is safe to serve at the root behind a prefix-stripping
-#     proxy. index.html references nothing root-absolute -- every asset is
-#     ./assets/... -- and the client derives both the websocket URL and the
-#     secondary-monitor URL from window.location.pathname. Asserted in
-#     image/test/acceptance.sh so a KasmVNC bump cannot quietly break it.
+#     proxy: index.html references nothing root-absolute -- every asset is
+#     ./assets/... -- and host, port and encrypt are all read from
+#     window.location.
+#
+#   * With ONE exception, which is the whole reason bin/cirrus-desktop-gate
+#     injects a query parameter: the client's websocket URL is assembled
+#     root-absolutely from a `path` setting defaulting to "websockify", so
+#     behind /rnode/ it asks for wss://<ondemand host>/websockify and the
+#     prefix is gone. The symptom is a client page that paints and then reports
+#     a failed connection. A `?path=` query parameter overrides it and is not
+#     persisted to localStorage, so it cannot go stale across sessions. See the
+#     module docstring in bin/cirrus-desktop-gate for the code this was read
+#     out of.
+#
+#     All of the above is asserted in image/test/acceptance.sh, which drives
+#     the websocket over the path the CLIENT would compute rather than a
+#     hand-written one -- writing that path by hand is exactly how this was
+#     missed the first time.
 #
 #   * The only Location header it ever emits is a 301 on a directory path
 #     without its trailing slash, and it is root-relative and unprefixed:

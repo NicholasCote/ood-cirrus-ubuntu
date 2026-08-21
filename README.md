@@ -171,19 +171,17 @@ that already carries the prefix gets it twice and the browser lands on
 Both halves were checked for KasmVNC.
 
 **Serving at the root.** The client page references no root-absolute asset —
-every one is `./assets/...` — and the bundle builds both the websocket URL and
-the secondary-monitor URL from `window.location.pathname`:
+every one is `./assets/...` — and `host`, `port` and `encrypt` all come from
+`window.location`:
 
 ```js
-let e = window.location.pathname, t = e.substring(0, e.lastIndexOf("/") + 1)
-...
-o.initSetting("path", "websockify")
+o.initSetting("host", window.location.hostname)
+o.initSetting("port", r)                            // location.port, else 443/80
+o.initSetting("encrypt", window.location.protocol === "https:")
 ```
 
-A stripped prefix is therefore invisible to it. The acceptance test asserts both
-the absence of root-absolute references and the presence of that
-`window.location.pathname` derivation, so a KasmVNC release that hardcoded a
-path would fail the build rather than produce a blank desktop.
+So all of that survives the proxy. **The websocket URL does not**, and that is
+the one place KasmVNC is not prefix-agnostic — see below.
 
 **Unprefixed redirects.** The only `Location` KasmVNC ever emits is a
 trailing-slash 301 on a directory path, and it is root-relative:
@@ -215,6 +213,82 @@ computes it into the ConfigMap and the entrypoint reads it.
 That page is a fallback nobody should reach; the Connect button posts straight
 to `/rnode/<node>/<port>/cirrus-signin`. But when someone does reach it, a form
 posting to the dashboard's own root is a 404 with nothing to read.
+
+### The websocket path, which the first live launch found
+
+Everything above is about what the *server* emits. The client has one URL it
+builds root-absolutely, and it is the important one. From the bundle in this
+image:
+
+```js
+a = o.getSetting("encrypt") ? "wss" : "ws";
+a += "://" + t;          // window.location.hostname
+r && (a += ":" + r);     // window.location.port, or 443/80
+a += "/" + i;            // o.getSetting("path"), default "websockify"
+```
+
+Behind `/rnode/` that is `wss://ondemand.ucar.edu/websockify`. The
+`/rnode/<node>/<port>` prefix is simply gone, and the handshake goes to the
+OnDemand dashboard's own root rather than to the pod.
+
+**The symptom is misleading**, which is why it is worth writing down: the client
+page loads perfectly — every asset is relative, so the whole UI paints — and
+then reports a failed connection. Nothing in the pod log says anything, because
+the handshake never arrived.
+
+The settings resolver is what makes it fixable from inside the pod:
+
+```js
+function hr(n,e){ const t = IA(n); return t===null ? CA(n,e) : t }   // query param first
+function Zb(n,e){ Mr[n] = e }                                        // in-memory only
+```
+
+`hr` checks a URL query parameter **before** localStorage or the default, and
+`Zb` — what `initSetting` uses to record the resolved value — writes to an
+in-memory map rather than to `localStorage`. Both halves matter. The first means
+a `?path=` parameter wins; the second means it is not persisted, so a value from
+an earlier session (carrying an earlier session's NodePort) cannot come back to
+haunt a later one on the same origin.
+
+So the gate answers a GET for the client document that has no `path=` of its own
+with a 302 to the same document carrying one:
+
+```
+GET /                             ->  302, Location: /?path=rnode/<node>/<port>/websockify
+GET /?path=rnode/…/websockify     ->  200, proxied to KasmVNC
+GET /screen.html?windowId=abc     ->  302, Location: /screen.html?windowId=abc&path=…
+```
+
+Root-relative and unprefixed as always, so the proxy prepends the prefix to the
+Location. Done on **every** document request rather than only after sign-in, so a
+reload gets the right value too instead of reverting to the default — and
+`screen.html` too, which is the secondary-monitor window the client opens
+itself.
+
+The whole chain, simulated against the real rewrite rule:
+
+```
+pod emits          : /?path=rnode/mlc1w9.k8s.ucar.edu/32072/websockify
+browser is sent to : /rnode/mlc1w9.k8s.ucar.edu/32072/?path=rnode/mlc1w9.k8s.ucar.edu/32072/websockify
+client opens       : wss://ondemand.ucar.edu/rnode/mlc1w9.k8s.ucar.edu/32072/websockify
+proxy forwards     : ws://mlc1w9.k8s.ucar.edu:32072/websockify
+```
+
+`CIRRUS_DESKTOP_ROOT_PATH` therefore has two consumers inside the pod: this, and
+the login form's action.
+
+**Why the acceptance test missed it, and what changed.** The old check asserted
+that the string `window.location.pathname` appeared *somewhere* in the bundle.
+It does — in the QOI worker loader and the secondary-monitor URL — so the check
+passed for the wrong reason. Worse, the websocket probe connected to a
+hand-written `/websockify`, a path the real client never asks for, so the one
+thing that mattered was the one thing not exercised.
+
+The test now derives the path instead of writing it: it reads the `path` the gate
+handed the client, builds the URL the way the client does, strips the prefix the
+way the `/rnode/` rule does, and requires the remainder to be what the pod
+serves — then drives the RFB handshake over exactly that. It also asserts the
+injection does not loop, and that a session with no prefix is *not* redirected.
 
 ## Keeping out of the shared home
 
@@ -403,7 +477,7 @@ podman build -t localhost/cirrus-desktop:dev -f image/Dockerfile image
 image/test/acceptance.sh
 ```
 
-Last run, 30 checks, all passing:
+Last run, 35 checks, all passing:
 
 ```
 == 1. arbitrary uid, runtime-synthesised numeric passwd entry ==
@@ -416,7 +490,7 @@ Last run, 30 checks, all passing:
 == 3. a session with no password refuses to start ==
   ok   no password: refuses to start, exit 1, and says why
 == 4. the desktop starts and the gate holds the port ==
-  ok   port answered 1s after container start (startup probe budget is 305s)
+  ok   port answered 0s after container start (startup probe budget is 305s)
   ok   the gate listens on 0.0.0.0:8080
   ok   KasmVNC listens on 127.0.0.1:8082 only
   ok   no X TCP port is open (unix sockets only)
@@ -425,24 +499,30 @@ Last run, 30 checks, all passing:
   ok   the gate never sends WWW-Authenticate (no native browser prompt)
   ok   wrong password refused (401)
   ok   correct password accepted, cookie issued
-  ok   sign-in redirects to '/', unprefixed, so the proxy's rewrite lands on /rnode/fakenode/30123/
+  ok   sign-in redirects to '/?path=rnode/fakenode/30123/websockify', unprefixed, so the proxy's rewrite lands under /rnode/fakenode/30123/
 == 6. what the proxy will do to what KasmVNC emits ==
   ok   301 '/app/' rewrites to '/rnode/fakenode/30123/app/'
   ok   a stale client Authorization header is replaced, not forwarded (200)
   ok   the KasmVNC client page loads through the gate (200)
   ok   the client page references no root-absolute asset (safe to serve at /)
-  ok   the client derives its URLs from window.location.pathname
+  ok   the client reads host/port from window.location (survives the proxy)
+  ok   the client still defaults its websocket path to a bare 'websockify'
+  ok   the document is redirected to '/?path=rnode/fakenode/30123/websockify' so the client learns the prefix
+  ok   a document that already carries path= is served, not redirected again
 == 7. websocket upgrade with a foreign Origin, and the desktop behind it ==
+  client would open ws://<host>/rnode/fakenode/30123/websockify ; the proxy forwards /websockify
+  ok   the client-computed path arrives at the pod as /websockify
   ok   no cookie: refused, no upgrade (HTTP/1.1 200 OK)
   ok   with the session cookie: 101, valid Sec-WebSocket-Accept, foreign Origin
   ok   the desktop is reachable: 1600x900 depth=24 name=x11 rects=1 pixelbytes=1024
 == 8. the home directory afterwards ==
-  contents: .bashrc .config .gitconfig .local .ssh_config_sample cirrus-desktop work
+  contents: .bashrc .config .gitconfig .local .ssh_config_sample cirrus-desktop work 
   ok   $HOME/cirrus-desktop was created
   ok   none of the XDG user dirs, .cache, .dbus, .ICEauthority or .config/xfce4 in $HOME
   ok   nothing new anywhere outside $HOME/cirrus-desktop
   ok   every pre-existing file is byte-identical (md5)
 == 9. idle watchdog ==
+  ok   with no proxy prefix the document is served directly, not redirected
   ok   a session with a client attached survives past its idle timeout
   ok   an idle session ends itself and exits 0 (so OnFailure does not restart it)
 == 10. versions recorded in the image ==
@@ -458,6 +538,12 @@ websocket with a foreign `Origin`, then `SetEncodings` for Raw and a
 depth=24 name=x11 rects=1 pixelbytes=1024` is a real framebuffer, so the check
 covers the whole chain — cookie, header injection, upgrade, relay in both
 directions, and an X server with a desktop on it.
+
+Crucially the path is **derived, not written**: the test reads the `path` the
+gate handed the client, assembles the URL the way the client does, strips the
+prefix the way OnDemand's `/rnode/` rule does, and connects to whatever remains.
+A hand-written `/websockify` here is what let the client's root-absolute URL
+through the first time.
 
 What it does not cover is a browser. The KasmVNC client negotiates encodings,
 resizes the desktop with `SetDesktopSize`, and streams webp; none of that is
@@ -560,6 +646,11 @@ question about a strange log line is which side it came from.
 3. **The browser client's `SetDesktopSize` works through the proxy**, which is
    why there is no resolution field on the form. If it does not, the desktop
    stays at `CIRRUS_DESKTOP_GEOMETRY` (1600x900) and that becomes a form field.
+
+The first live launch already found one of these the hard way — the client's
+websocket URL, above. The lesson generalised: a hand-written path in a test is
+not a test of what the client does. Anything the *client* computes should be
+derived in the test from what the pod actually tells it.
 
 ## CI
 

@@ -8,10 +8,12 @@
   # to the tag you have tested, never to something floating. The CI run's job
   # summary carries the line to paste.
   #
-  # PLACEHOLDER. CI has not run yet, so this tag does not exist in Harbor and a
-  # launch against it will sit in ImagePullBackOff. Replace it with the tag from
-  # the first green run of .github/workflows/build.yml -- and run
-  # image/test/acceptance.sh against that tag before announcing the app.
+  # NEEDS BUMPING. The tag below is the first build, which predates the fix for
+  # the client's websocket path: behind /rnode/ the KasmVNC client assembles
+  # wss://<ondemand host>/websockify root-absolutely, losing the proxy prefix,
+  # so the client page paints and then reports a failed connection. The gate now
+  # hands it the prefix as a ?path= parameter -- see "The websocket path" in
+  # bin/cirrus-desktop-gate. Re-run CI and pin the new tag.
   # ---------------------------------------------------------------------------
   desktop_img = "hub.k8s.ucar.edu/ncote/ubuntu-desktop:2026-08-21.17.45"
 
