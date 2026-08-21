@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+#
+# What is actually in this image. `desktop-versions` prints the record made at
+# build time; `desktop-versions --check` re-resolves each component and diffs
+# against it.
+#
+# The record exists so a bug report can name versions without anyone having to
+# guess from a tag, and the --check mode exists because a record that is never
+# verified drifts: a base-image rebuild can change every one of these while the
+# Dockerfile stays byte-identical.
+
+set -uo pipefail
+
+RECORD="${CIRRUS_DESKTOP_HOME:-/opt/cirrus-desktop}/versions.txt"
+
+resolve() {
+    case "$1" in
+        base-image)    sed -n 's/^base-image\t//p' "$RECORD" ;;   # build-time only
+        ubuntu)        (. /etc/os-release; printf '%s' "${VERSION_ID}") ;;
+        kasmvnc)       dpkg-query -W -f='${Version}' kasmvncserver 2>/dev/null ;;
+        xkasmvnc)      Xkasmvnc -version 2>&1 | sed -n 's/^Xvnc KasmVNC \([^ ]*\).*/\1/p' | head -1 ;;
+        xfce4-session) dpkg-query -W -f='${Version}' xfce4-session 2>/dev/null ;;
+        xfwm4)         dpkg-query -W -f='${Version}' xfwm4 2>/dev/null ;;
+        thunar)        dpkg-query -W -f='${Version}' thunar 2>/dev/null ;;
+        python3)       python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])' ;;
+        git)           git --version | awk '{print $3}' ;;
+        *)             printf '' ;;
+    esac
+}
+
+if [ ! -r "$RECORD" ]; then
+    printf 'desktop-versions: %s is missing; this is not a CIRRUS desktop image.\n' \
+           "$RECORD" >&2
+    exit 1
+fi
+
+if [ "${1:-}" != "--check" ]; then
+    cat "$RECORD"
+    exit 0
+fi
+
+rc=0
+while IFS="$(printf '\t')" read -r name want; do
+    case "$name" in ''|\#*) continue ;; esac
+    got="$(resolve "$name" 2>/dev/null || true)"
+    if [ "$got" = "$want" ]; then
+        printf 'ok   %-14s %s\n' "$name" "$want"
+    else
+        printf 'DIFF %-14s recorded=%s actual=%s\n' "$name" "$want" "${got:-<unresolved>}"
+        rc=1
+    fi
+done < "$RECORD"
+exit "$rc"

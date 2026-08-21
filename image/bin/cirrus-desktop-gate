@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+r"""Per-session password gate in front of KasmVNC.
+
+Why this exists
+---------------
+Not because KasmVNC fails to authenticate -- it does, properly. Measured against
+the KasmVNC in this image (1.5.0):
+
+    $ curl -o /dev/null -w '%{http_code}' http://127.0.0.1:8082/          -> 401
+    $ curl -o /dev/null -w '%{http_code}' -u ncote:WRONG      .../        -> 401
+    $ curl -o /dev/null -w '%{http_code}' -u ncote:correct    .../        -> 200
+    GET /websockify  without Authorization                                -> 401
+    GET /websockify  with it, Origin: https://ondemand.ucar.edu           -> 101
+
+with `WWW-Authenticate: Basic realm="Websockify"` on the refusals and
+brute-force blacklisting behind it (-BlacklistThreshold, default 5 attempts).
+
+The problem is the shape of that credential, not its strength. HTTP Basic is a
+header the browser sends only after its own native dialog, so:
+
+  * the dashboard's Connect button, which is a form POST, cannot supply it. The
+    user has already authenticated to OnDemand; being asked to type a second
+    password into a browser dialog is the thing this app exists not to do.
+  * browsers cache Basic credentials per ORIGIN, and every session on this site
+    shares the OnDemand origin. Two concurrent desktops would therefore fight
+    over one cached credential, and the loser gets 401s it cannot explain.
+
+So this process holds the public port, converts one POST from the dashboard into
+a cookie, and adds the Authorization header itself on the way through to a
+KasmVNC bound to loopback.
+
+Design notes
+------------
+* KasmVNC's own auth stays ON behind this. That is affordable because every
+  response it sends carries `Connection: close` and the server does close, even
+  when the request asked for keep-alive -- verified by sending
+  `Connection: keep-alive` and watching the socket end after one response. One
+  request per connection means checking the first request head is checking every
+  request, and adding the header to that one head covers all of them. A server
+  that reused connections would need a full HTTP parser here, and would get
+  -DisableBasicAuth instead.
+
+* Any Authorization header the client sent is REMOVED before ours is added,
+  never appended after. A browser that has a stale Basic credential cached for
+  this origin -- the exact situation described above -- would otherwise send it,
+  and KasmVNC reads the first one.
+
+* Pure standard library. The relay costs nothing measurable: 64 MiB through this
+  design moves at 2877 MiB/s (24 Gbit/s) on loopback against 10517 MiB/s
+  direct, and a KasmVNC stream is tens of Mbit/s. The pixel path is not where
+  the time goes.
+
+* After the head, the connection is a blind byte relay in both directions. That
+  is what keeps the desktop working at all: /websockify upgrades, and an
+  upgraded connection is no longer HTTP to parse. A browser sends its cookies
+  on the handshake like any other request, so the handshake is checked exactly
+  like a GET.
+
+* It never rewrites a body, and it deliberately does not put the proxy prefix
+  into anything the proxy handles itself. OnDemand's /rnode/ block does both
+  halves:
+
+      Header edit Location "^([^/]+//[^/]+)|(?=/)|^([\./]{1,}(?<!/))" \
+                           "/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+      Header edit* Set-Cookie ";\s*(?i)Path[^;]*" ""
+      Header edit  Set-Cookie "^([^;]+)" "$1; Path=/rnode/%{MATCH_HOST}e/%{MATCH_PORT}e"
+
+  -- it strips the prefix on the way in, and prepends it to every Location and
+  rewrites every cookie Path on the way out. So the 302 this process sends after
+  a successful sign-in has to be plain "/". Sent as /rnode/<node>/<port>/ it
+  arrives at the browser as /rnode/<node>/<port>/rnode/<node>/<port>/, which is
+  a 404 on the dashboard.
+
+  What the proxy does NOT rewrite is response bodies. The login form's action is
+  in a body, and the browser resolves it against the OnDemand host, so that one
+  string does need the full prefix -- and that is the only reason
+  CIRRUS_DESKTOP_ROOT_PATH exists.
+"""
+
+import base64
+import hmac
+import os
+import re
+import secrets
+import socket
+import sys
+import threading
+import urllib.parse
+
+PROG = "cirrus-desktop-gate"
+
+LISTEN_PORT = int(os.environ.get("CIRRUS_DESKTOP_PORT", "8080"))
+UPSTREAM_PORT = int(os.environ.get("CIRRUS_DESKTOP_UPSTREAM_PORT", "8082"))
+UPSTREAM_HOST = "127.0.0.1"
+ROOT_PATH = os.environ.get("CIRRUS_DESKTOP_ROOT_PATH", "/")
+PASSWORD_FILE = os.environ.get(
+    "CIRRUS_DESKTOP_PASSWORD_FILE_RESOLVED", "/tmp/cirrus-desktop/session-password"
+)
+# The name KasmVNC knows, which is what kasmvncpasswd -u was given and what
+# api/get_sessions reports back.
+BASIC_USER = os.environ.get("CIRRUS_DESKTOP_BASIC_USER") or str(os.getuid())
+
+COOKIE_NAME = "cirrus_desktop_gate"
+SIGNIN_PATH = "cirrus-signin"
+
+# The head of an HTTP request is small; anything larger than this before the
+# blank line is not a request we should be forwarding.
+MAX_HEAD = 64 * 1024
+RELAY_CHUNK = 65536
+
+
+def log(msg):
+    print("%s: %s" % (PROG, msg), file=sys.stderr, flush=True)
+
+
+def read_password():
+    try:
+        with open(PASSWORD_FILE) as fh:
+            return fh.read().strip()
+    except OSError as exc:
+        log("cannot read %s: %s" % (PASSWORD_FILE, exc))
+        return ""
+
+
+# One token per process. It is what the cookie carries, so the password itself
+# is never stored in the browser and a token from a previous pod is worthless.
+SESSION_TOKEN = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode().rstrip("=")
+
+
+def http_response(status, body, extra_headers=()):
+    body_bytes = body.encode("utf-8")
+    head = [
+        "HTTP/1.1 %s" % status,
+        "Content-Type: text/html; charset=utf-8",
+        "Content-Length: %d" % len(body_bytes),
+        "Cache-Control: no-store",
+        "X-Content-Type-Options: nosniff",
+        "Connection: close",
+    ]
+    head.extend(extra_headers)
+    return ("\r\n".join(head) + "\r\n\r\n").encode("utf-8") + body_bytes
+
+
+LOGIN_PAGE = """<!doctype html>
+<title>Ubuntu Desktop &middot; CIRRUS</title>
+<style>
+ body {{ font-family: system-ui, sans-serif; margin: 4rem auto; max-width: 30rem;
+        color: #1a1a1a; background: #fff; }}
+ form {{ display: flex; gap: .5rem; margin: 1.5rem 0; }}
+ input[type=password] {{ flex: 1; padding: .5rem; font-size: 1rem; }}
+ button {{ padding: .5rem 1rem; font-size: 1rem; }}
+ p.err {{ color: #a00; }}
+ p.note {{ color: #555; font-size: .9rem; }}
+</style>
+<h1>Ubuntu Desktop</h1>
+{message}
+<form method="post" action="{action}">
+  <input type="password" name="password" autofocus placeholder="Session password">
+  <button type="submit">Connect</button>
+</form>
+<p class="note">You should not normally see this page. This session has its own
+password, generated when it launched, and the <b>Connect to Ubuntu Desktop</b>
+button on the OnDemand dashboard sends it for you &mdash; go back there and use
+it rather than typing anything here.</p>
+"""
+
+
+def login_page(action, error=None):
+    message = '<p class="err">%s</p>' % error if error else ""
+    return LOGIN_PAGE.format(message=message, action=action)
+
+
+def parse_head(head):
+    """Return (method, path, headers-dict-lowercased, lines). Malformed -> None."""
+    try:
+        text = head.decode("latin-1")
+    except UnicodeDecodeError:
+        return None
+    lines = text.split("\r\n")
+    parts = lines[0].split(" ")
+    if len(parts) < 3:
+        return None
+    method, path = parts[0], parts[1]
+    headers = {}
+    for line in lines[1:]:
+        if not line:
+            continue
+        name, _, value = line.partition(":")
+        # Repeated headers are joined the way the RFC says to, which matters for
+        # Cookie: browsers may send it more than once.
+        name = name.strip().lower()
+        value = value.strip()
+        if name in headers:
+            headers[name] = headers[name] + "; " + value
+        else:
+            headers[name] = value
+    return method, path, headers, lines
+
+
+def has_valid_cookie(headers):
+    raw = headers.get("cookie", "")
+    for item in raw.split(";"):
+        name, _, value = item.strip().partition("=")
+        if name == COOKIE_NAME:
+            # compare_digest, not ==: the token is a secret and a timing
+            # difference on a 43-character comparison is a real oracle.
+            if hmac.compare_digest(value, SESSION_TOKEN):
+                return True
+    return False
+
+
+def authorised_head(lines, password):
+    """The request head to send upstream, carrying our Basic credential.
+
+    Any Authorization the client sent is dropped rather than kept: a browser
+    with a stale Basic credential cached for the OnDemand origin -- which is
+    every browser that has ever been prompted by another session on this host --
+    would otherwise supply it, and KasmVNC honours the first one it reads.
+    """
+    kept = [lines[0]]
+    for line in lines[1:]:
+        if not line:
+            continue
+        if line.split(":", 1)[0].strip().lower() == "authorization":
+            continue
+        kept.append(line)
+    token = base64.b64encode(("%s:%s" % (BASIC_USER, password)).encode()).decode()
+    kept.append("Authorization: Basic %s" % token)
+    return "\r\n".join(kept).encode("latin-1")
+
+
+def normalised_root():
+    """The prefix the browser sees, with exactly one trailing slash.
+
+    For the login form's action only. Never for a Location or a cookie Path --
+    see the note in the module docstring about the proxy rewriting both.
+    """
+    root = ROOT_PATH if ROOT_PATH.startswith("/") else "/" + ROOT_PATH
+    return root if root.endswith("/") else root + "/"
+
+
+def signin_target(raw):
+    """Where to send the browser after a correct password, as the APP sees it.
+
+    Root-relative and unprefixed, always: the proxy prepends its prefix to
+    whatever Location it forwards. Talking to this gate directly -- the
+    acceptance test, a port-forward -- "/" is also exactly right.
+
+    A caller-supplied `to` is honoured only if it is a single-slash-rooted path.
+    "//host/..." and "/\\host/..." are how a browser is sent to another origin,
+    and CR or LF would be a header injection, so all three are refused rather
+    than sanitised.
+    """
+    if (
+        raw.startswith("/")
+        and not raw.startswith("//")
+        and not raw.startswith("/\\")
+        and "\r" not in raw
+        and "\n" not in raw
+    ):
+        return raw
+    return "/"
+
+
+SIGNIN_URL = normalised_root() + SIGNIN_PATH
+
+
+def is_signin_request(path):
+    """Does this request target the sign-in endpoint?
+
+    Matched on the suffix, not the whole path, because the two OnDemand proxies
+    deliver it differently: /rnode/ strips its prefix, so the request arrives as
+    /cirrus-signin, while a direct connection or a non-stripping proxy would
+    deliver the whole /rnode/<node>/<port>/cirrus-signin.
+    """
+    return path.split("?", 1)[0].endswith("/" + SIGNIN_PATH)
+
+
+def read_head(sock):
+    """Read up to and including the blank line. Returns (head, leftover)."""
+    buf = b""
+    while b"\r\n\r\n" not in buf:
+        if len(buf) > MAX_HEAD:
+            return None, b""
+        try:
+            chunk = sock.recv(RELAY_CHUNK)
+        except OSError:
+            return None, b""
+        if not chunk:
+            return None, b""
+        buf += chunk
+    head, _, rest = buf.partition(b"\r\n\r\n")
+    return head, rest
+
+
+def read_body(sock, headers, already):
+    length = headers.get("content-length", "")
+    if not re.fullmatch(r"\d{1,9}", length):
+        return already
+    length = int(length)
+    body = already
+    while len(body) < length:
+        try:
+            chunk = sock.recv(min(RELAY_CHUNK, length - len(body)))
+        except OSError:
+            break
+        if not chunk:
+            break
+        body += chunk
+    return body
+
+
+def relay(src, dst):
+    try:
+        while True:
+            data = src.recv(RELAY_CHUNK)
+            if not data:
+                break
+            dst.sendall(data)
+    except OSError:
+        pass
+    finally:
+        # Half-close rather than close: the other direction may still be
+        # delivering, which for a websocket is the normal state of affairs.
+        for sock in (src, dst):
+            try:
+                sock.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+
+def proxy(client, head, leftover):
+    upstream = socket.create_connection((UPSTREAM_HOST, UPSTREAM_PORT), timeout=30)
+    upstream.settimeout(None)
+    client.settimeout(None)
+    upstream.sendall(head + b"\r\n\r\n" + leftover)
+    threads = [
+        threading.Thread(target=relay, args=(client, upstream), daemon=True),
+        threading.Thread(target=relay, args=(upstream, client), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    for sock in (client, upstream):
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def handle(client, addr):
+    try:
+        client.settimeout(60)
+        head, leftover = read_head(client)
+        if head is None:
+            return
+        parsed = parse_head(head)
+        if parsed is None:
+            client.sendall(http_response("400 Bad Request", "<h1>Bad request</h1>"))
+            return
+        method, path, headers, lines = parsed
+        # The form action has to be what the BROWSER sees, which is not what
+        # this process sees: OnDemand's /rnode/ proxy strips its prefix before
+        # forwarding, so the request path here has no prefix at all, and a body
+        # is the one thing the proxy will not rewrite on the way back. The
+        # prefix is passed in instead, computed by an init container from the
+        # node name and the assigned NodePort -- neither of which exists until
+        # the pod is scheduled.
+        action = SIGNIN_URL
+
+        if has_valid_cookie(headers):
+            password = read_password()
+            if not password:
+                # The password file has gone. Refusing is the only honest
+                # answer: relaying without the header would hand the browser
+                # KasmVNC's own 401 and its native dialog, which is precisely
+                # the experience this gate exists to prevent.
+                client.sendall(
+                    http_response(
+                        "503 Service Unavailable",
+                        "<h1>This session has lost its password file</h1>",
+                    )
+                )
+                return
+            proxy(client, authorised_head(lines, password), leftover)
+            return
+
+        if method == "POST" and is_signin_request(path):
+            body = read_body(client, headers, leftover)
+            fields = urllib.parse.parse_qs(body.decode("latin-1", "replace"))
+            supplied = (fields.get("password") or [""])[0]
+            expected = read_password()
+            if expected and hmac.compare_digest(supplied, expected):
+                # Both of these are what the APP is mounted at, not what the
+                # browser sees. The proxy rewrites the Location and replaces the
+                # cookie's Path with /rnode/<node>/<port>, which is what scopes
+                # the cookie to this session and to nothing else on the OnDemand
+                # host; setting that prefix here instead gets it applied twice.
+                redirect = signin_target((fields.get("to") or [""])[0])
+                cookie_path = "/"
+                log("sign-in accepted from %s" % (addr[0],))
+                client.sendall(
+                    http_response(
+                        "302 Found",
+                        '<a href="%s">Ubuntu Desktop</a>' % redirect,
+                        (
+                            "Location: %s" % redirect,
+                            "Set-Cookie: %s=%s; Path=%s; HttpOnly; SameSite=Lax"
+                            % (COOKIE_NAME, SESSION_TOKEN, cookie_path),
+                        ),
+                    )
+                )
+            else:
+                log("sign-in refused from %s" % (addr[0],))
+                client.sendall(
+                    http_response(
+                        "401 Unauthorized",
+                        login_page(action, "That is not this session's password."),
+                    )
+                )
+            return
+
+        # Anything else without a cookie gets the login form, with the status
+        # matching what it is: a refusal for an API call, a page for a browser.
+        # Deliberately no WWW-Authenticate header -- that is what would summon
+        # the browser's own credential dialog.
+        status = "200 OK" if method == "GET" else "401 Unauthorized"
+        client.sendall(http_response(status, login_page(action)))
+    except OSError:
+        pass
+    finally:
+        try:
+            client.close()
+        except OSError:
+            pass
+
+
+def main():
+    password = read_password()
+    if not password:
+        log("no session password is available; refusing to start.")
+        log("Every request would be rejected, which is worse than not starting:")
+        log("the pod would look healthy and no one could get in.")
+        return 1
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("0.0.0.0", LISTEN_PORT))
+    listener.listen(128)
+    log(
+        "listening on 0.0.0.0:%d, forwarding to %s:%d as '%s' (sign-in at %s)"
+        % (LISTEN_PORT, UPSTREAM_HOST, UPSTREAM_PORT, BASIC_USER, SIGNIN_URL)
+    )
+
+    while True:
+        try:
+            client, addr = listener.accept()
+        except OSError as exc:
+            log("accept failed: %s" % exc)
+            continue
+        threading.Thread(target=handle, args=(client, addr), daemon=True).start()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

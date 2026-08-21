@@ -1,0 +1,36 @@
+<%#
+  The Connect button.
+
+  Posts the session password to the gate that fronts KasmVNC and lands the user
+  in the desktop with nothing typed. That is the point of the gate: the user has
+  already authenticated to OnDemand, and asking them for a second password --
+  which is what KasmVNC's own HTTP Basic auth would do, through the browser's
+  native credential dialog -- is the experience this app exists to avoid.
+
+  `password`, `host` and `port` come from the connection info the kubernetes
+  adapter assembles: host and port from the pod's node and the service's
+  NodePort, and password from the <pod>-secret written by the init-secret
+  container -- the adapter exposes every key of that Secret here. This template
+  cannot see the launch form at all, which is why nothing here depends on one;
+  info.md.erb is the template with user_context.
+
+  /rnode/, not /node/, and the two are not interchangeable. OnDemand's /node/
+  proxy forwards the whole path; /rnode/ strips its prefix on the way in and
+  prepends it again to every Location header and cookie Path on the way out.
+  KasmVNC needs the stripping one: it serves at the root, references every asset
+  relatively, and builds its websocket URL from window.location.pathname, so a
+  stripped prefix is invisible to it. Pointed at /node/ every request would land
+  on KasmVNC's own 404.
+
+  Because /rnode/ does the putting-back itself, nothing inside the session emits
+  the prefix: the gate redirects to "/" and KasmVNC's only redirect is a
+  root-relative trailing-slash 301. The one exception is right here. This is a
+  response body, and the proxy rewrites headers only, so the form action has to
+  be the full path the browser will resolve against the OnDemand host.
+-%>
+<form action="/rnode/<%= host %>/<%= port %>/cirrus-signin" method="post" target="_blank">
+  <input type="hidden" name="password" value="<%= password %>">
+  <button class="btn btn-primary" type="submit">
+    <i class="fa fa-desktop"></i> Connect to Ubuntu Desktop
+  </button>
+</form>

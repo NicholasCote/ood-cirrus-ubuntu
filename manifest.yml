@@ -1,0 +1,17 @@
+---
+name: Ubuntu Desktop (CIRRUS)
+category: Interactive Apps
+subcategory: Desktops
+role: batch_connect
+description: |
+  This app launches a full [XFCE] desktop on Ubuntu 24.04 on the CIRRUS
+  Kubernetes cluster, in your browser, with your GLADE home directory mounted.
+
+  The desktop's own settings — panel layout, theme, keyboard shortcuts, the
+  Desktop folder — live in `~/cirrus-desktop/`, deliberately separate from the
+  `~/.config` your Casper and Derecho sessions read.
+
+  There is a terminal, a file manager and a text editor. Everything else you
+  bring from your home directory.
+
+  [XFCE]: https://www.xfce.org/

@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+#
+# The XFCE session, started by entrypoint.sh once the X server is accepting
+# connections. A separate script rather than a line in the entrypoint because
+# this is the process whose children are everything the user sees, and its
+# environment is worth being able to read in one place.
+#
+# Nothing here is allowed to write to $HOME outside $HOME/cirrus-desktop --
+# entrypoint.sh has already redirected every XDG variable, ICEAUTHORITY,
+# XAUTHORITY and the session bus, and image/test/acceptance.sh asserts the
+# result byte-for-byte against a pre-populated home.
+
+set -uo pipefail
+
+log() { printf 'cirrus-desktop-session: %s\n' "$*" >&2; }
+
+# The desktop's stderr is the pod log, and it is not the user's: they see a
+# framebuffer, not a stream. So anything an application printed while the user
+# was doing something lands in `kubectl logs`, and this is the one place to say
+# so. Terminals are the exception -- xfce4-terminal gives its children their own
+# pty, so what a user runs interactively stays in the window.
+log "starting XFCE on ${DISPLAY:-<no DISPLAY>}"
+log "everything the session prints from here on is in the pod log, not the desktop"
+
+# xfsettingsd owns the cursor theme, fonts and the GTK theme; without a settings
+# daemon the desktop comes up with a black-and-white cursor and no icon theme,
+# which reads as a broken image. xfce4-session starts it, so it is not launched
+# here -- this comment exists because "why is the cursor an X" is otherwise a
+# long afternoon.
+exec xfce4-session

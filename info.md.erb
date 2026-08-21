@@ -1,0 +1,22 @@
+<%#
+  Rendered into the session card by the dashboard.
+
+  The binding here is the BatchConnect::Session, so user_context is available --
+  the launch form values, read back from user_defined_context.json. That is a
+  different binding from view.html.erb, which sees only the connection info and
+  the keys of <pod>-secret.
+
+  Keys are form attribute ids, so this tracks form.yml.
+-%>
+<%- cpus = user_context["cpu"].to_s.strip -%>
+<%- mem  = user_context["memory"].to_s.strip -%>
+<%- unless cpus.empty? || mem.empty? -%>
+**Resources:** <%= cpus %> CPU<%= "s" unless cpus == "1" %>, <%= mem %> GB
+<%- end -%>
+
+Your desktop settings live in `~/cirrus-desktop/`, not in `~/.config` — so this
+session cannot change how XFCE, GTK or Thunar behave anywhere else you log in.
+Anything you want to keep, save it under your home directory as usual.
+
+The session ends itself after an hour with nothing connected, so closing the tab
+releases the CPU and memory rather than holding them.

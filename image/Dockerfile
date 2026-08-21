@@ -1,0 +1,267 @@
+# CIRRUS Ubuntu Desktop image
+#
+# One Open OnDemand Batch Connect app: a full XFCE desktop on Ubuntu 24.04,
+# served to the browser by KasmVNC, running as a pod on the CIRRUS mlc1
+# Kubernetes cluster with the user's GLADE home mounted.
+#
+# ---------------------------------------------------------------------------
+# Why KasmVNC, and why one component rather than a stack
+#
+# OnDemand's node proxy carries HTTP and WebSocket over one TCP port and nothing
+# else. That rules out the WebRTC desktops (Selkies and friends): they need a
+# UDP path, and without one they need a TURN server to relay over TCP, which
+# this site does not have.
+#
+# So a websocket-framed RFB stream it is, and KasmVNC is that in one process --
+# X server, RFB encoder, HTTP server, websocket endpoint and the web client all
+# in Xkasmvnc. The alternative (TigerVNC + websockify + noVNC) is three
+# components, two of which exist only to bridge what KasmVNC does natively.
+#
+# Verified against the KasmVNC in this image (1.5.0), not taken from
+# documentation:
+#
+#   * It serves the web client and accepts the websocket on the SAME port:
+#       vncext: Listening for websocket connections on 0.0.0.0 interface(s), port 8080
+#     One port is all the OnDemand proxy gives us.
+#
+#   * It authenticates for real. Every request, the /websockify upgrade
+#     included, is HTTP Basic against -KasmPasswordFile, with brute-force
+#     blacklisting (-BlacklistThreshold, default 5):
+#       $ curl -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/         -> 401
+#       $ curl -o /dev/null -w '%{http_code}' -u ncote:WRONG   .../          -> 401
+#       $ curl -o /dev/null -w '%{http_code}' -u ncote:right   .../          -> 200
+#       GET /websockify with no Authorization                                -> 401
+#       GET /websockify with it, Origin: https://ondemand.ucar.edu            -> 101
+#
+#   * Its own HTML is safe to serve at the root behind a prefix-stripping
+#     proxy. index.html references nothing root-absolute -- every asset is
+#     ./assets/... -- and the client derives both the websocket URL and the
+#     secondary-monitor URL from window.location.pathname. Asserted in
+#     image/test/acceptance.sh so a KasmVNC bump cannot quietly break it.
+#
+#   * The only Location header it ever emits is a 301 on a directory path
+#     without its trailing slash, and it is root-relative and unprefixed:
+#       GET /app  ->  301, Location: /app/
+#     which is exactly what /rnode/ wants; the proxy prepends its prefix and
+#     the browser lands on /rnode/<node>/<port>/app/.
+#
+#   * Every response carries `Connection: close` and the server does close,
+#     even when the request asked for keep-alive. That is what makes the gate
+#     in bin/cirrus-desktop-gate a COMPLETE check rather than a first-request
+#     one: there is no second request on an already-authorised connection.
+#
+#   * api/get_sessions reports connected clients, which is the signal the idle
+#     watchdog needs. Empty with nobody attached, populated by a real RFB
+#     client:
+#       {"users":[]}
+#       {"users": [{"username":"ncote", "connected_since":"2026-08-21 16:49:29"}]}
+#     A websocket that upgrades but never completes the RFB handshake does NOT
+#     count, which is correct -- that is not a session.
+# ---------------------------------------------------------------------------
+FROM ubuntu:24.04
+
+ARG BASE_IMAGE=docker.io/library/ubuntu:24.04
+
+# Pinned, never floating. Bump deliberately and re-run image/test/acceptance.sh:
+# the acceptance checks assert things about KasmVNC's own HTML and headers that
+# a new release could change.
+ARG KASMVNC_VERSION=1.5.0
+ARG KASMVNC_DEB=kasmvncserver_noble_1.5.0_amd64.deb
+ARG KASMVNC_SHA256=
+
+ENV CIRRUS_DESKTOP_HOME=/opt/cirrus-desktop
+
+# ---------------------------------------------------------------------------
+# Packages.
+#
+# XFCE core plus a terminal, a file manager and a text editor, and nothing else.
+# That is the deliberate scope: the reason to open a desktop here is to look at
+# and manipulate files on GLADE, and everything a user needs beyond that they
+# already have in their home directory. A fuller desktop is mostly a larger
+# image to pull on every cold node.
+#
+# Notes on individual choices, each of which cost something to find out:
+#
+# dbus-x11        provides dbus-launch, and pulls in dbus for dbus-daemon.
+#                 The entrypoint does NOT use dbus-launch: it runs dbus-daemon
+#                 itself, because dbus-launch starts it as
+#                   /usr/bin/dbus-daemon --syslog --fork ...
+#                 and there is no syslog daemon in a container, so everything
+#                 the session bus has to say is discarded. dbus-launch also
+#                 writes $HOME/.dbus/session-bus/<machine-id>-<display>, which
+#                 is a write into the shared GLADE home.
+# xauth           Xkasmvnc writes an X authority file; without xauth the
+#                 cookie is never created and every client is refused.
+# openssh-client  xfce4-session looks for an ssh-agent at start-up and says
+#                 "No SSH authentication agent found" without one. git over
+#                 ssh from the desktop terminal is a real workflow here.
+# libnss-wrapper  the arbitrary-uid case. The pod runs as the user's NFS uid,
+#                 which has no passwd entry, and XFCE, the terminal prompt,
+#                 git and ssh all call getpwuid().
+# python3         the gate and the preference seeding. Standard library only.
+# procps          pgrep/pkill for the supervisor.
+# xdg-user-dirs   installed for the `xdg-user-dir` command; its automatic
+#                 directory creation is switched off in etc/xdg/user-dirs.conf
+#                 below, which is the whole point of installing it explicitly.
+#
+# Deliberately NOT installed: tumbler. Thunar Recommends it for thumbnails, and
+# --no-install-recommends leaves it out. Thumbnails are a cache written per
+# image file, and the cost of them is an extra writer aimed at the home
+# directory. Image previews in Thunar are the visible loss.
+# ---------------------------------------------------------------------------
+RUN DEBIAN_FRONTEND=noninteractive apt-get update \
+    && DEBIAN_FRONTEND=noninteractive apt-get -y upgrade \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        ca-certificates \
+        curl \
+        dbus-x11 \
+        git \
+        less \
+        libnss-wrapper \
+        nano \
+        openssh-client \
+        procps \
+        python3 \
+        xauth \
+        xdg-user-dirs \
+        adwaita-icon-theme \
+        fonts-dejavu-core \
+        libgl1 \
+        libglx-mesa0 \
+        mousepad \
+        thunar \
+        xfce4-appfinder \
+        xfce4-panel \
+        xfce4-session \
+        xfce4-settings \
+        xfce4-terminal \
+        xfconf \
+        xfdesktop4 \
+        xfwm4 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# KasmVNC.
+#
+# The .deb, not a build from source: the release assets include a noble amd64
+# package, and it pulls its X and perl dependencies through apt like anything
+# else. Installed with `apt-get install ./file.deb` rather than dpkg -i so those
+# dependencies resolve in one step.
+#
+# The checksum is verified when KASMVNC_SHA256 is set, and the build fails if it
+# is set and does not match. It is empty by default rather than fabricated --
+# a wrong-but-present hash that nobody has checked is worse than an honest
+# absence, and the version above is pinned regardless.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    curl -fsSL -o /tmp/kasmvnc.deb \
+        "https://github.com/kasmtech/KasmVNC/releases/download/v${KASMVNC_VERSION}/${KASMVNC_DEB}"; \
+    if [ -n "${KASMVNC_SHA256}" ]; then \
+        echo "${KASMVNC_SHA256}  /tmp/kasmvnc.deb" | sha256sum -c -; \
+    fi; \
+    DEBIAN_FRONTEND=noninteractive apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends /tmp/kasmvnc.deb; \
+    rm -f /tmp/kasmvnc.deb; \
+    rm -rf /var/lib/apt/lists/*
+
+# ---------------------------------------------------------------------------
+# The X and ICE socket directories.
+#
+# Both are hardcoded in libX11/libICE and neither is created by the packages.
+# Without them, as an unprivileged uid:
+#   _XSERVTransmkdir: ERROR: euid != 0,directory /tmp/.X11-unix will not be created.
+#   _IceTransmkdir:   ERROR: euid != 0,directory /tmp/.ICE-unix will not be created.
+# The session survives on abstract sockets, but any client that only speaks the
+# filesystem path does not. 1777, like /tmp itself.
+#
+# The entrypoint creates them again at runtime, because a pod may have something
+# mounted over /tmp and then the image's copies are invisible.
+# ---------------------------------------------------------------------------
+RUN mkdir -p /tmp/.X11-unix /tmp/.ICE-unix && chmod 1777 /tmp/.X11-unix /tmp/.ICE-unix
+
+# ---------------------------------------------------------------------------
+# Switch off automatic XDG user-directory creation, site-wide.
+#
+# This is the trap in a shared home. Left alone, xdg-user-dirs-update runs from
+# the XFCE session start-up and creates eight directories directly in $HOME --
+# measured on this image with no configuration at all:
+#   Desktop Documents Downloads Music Pictures Public Templates Videos
+# all of them straight into the user's GLADE home, shared with Casper and
+# Derecho.
+#
+# `enabled=False` in /etc/xdg/user-dirs.conf stops the creation. The entrypoint
+# additionally pins user-dirs.dirs inside this app's own configuration
+# directory, so the values GTK and xfdesktop read are ours and not defaults
+# resolved against $HOME. Two mechanisms because they fail differently: this one
+# stops the writer, that one fixes the readers.
+# ---------------------------------------------------------------------------
+COPY --chmod=0644 etc/xdg/user-dirs.conf /etc/xdg/user-dirs.conf
+
+# ---------------------------------------------------------------------------
+# Our scripts. /usr/local/bin is on PATH for the entrypoint and for every
+# terminal the desktop spawns.
+# ---------------------------------------------------------------------------
+COPY --chmod=0755 bin/entrypoint.sh           /usr/local/bin/entrypoint.sh
+COPY --chmod=0755 bin/cirrus-desktop-gate     /usr/local/bin/cirrus-desktop-gate
+COPY --chmod=0755 bin/cirrus-desktop-session  /usr/local/bin/cirrus-desktop-session
+COPY --chmod=0755 bin/desktop-versions        /usr/local/bin/desktop-versions
+
+# Read by any login shell inside the session. The desktop's own processes
+# inherit their environment from the entrypoint, so this is the belt-and-braces
+# path: a `bash -l` started from somewhere that did not inherit it still lands
+# on the same XDG redirection instead of writing to the shared home.
+COPY --chmod=0644 etc/profile.d/cirrus-desktop.sh /etc/profile.d/cirrus-desktop.sh
+
+# ---------------------------------------------------------------------------
+# Resolved versions, recorded once at build time so a bug report can name them.
+# `desktop-versions` prints this file; `desktop-versions --check` re-runs each
+# component and diffs against the record.
+#
+# The nss_wrapper library path is resolved here too. Finding it at runtime would
+# mean running ldconfig in every session, and a miss would surface at the worst
+# possible moment -- after the desktop is already up, as a terminal prompt
+# showing a bare uid.
+# ---------------------------------------------------------------------------
+RUN set -eu; \
+    mkdir -p "${CIRRUS_DESKTOP_HOME}"; \
+    { \
+      echo "# CIRRUS Ubuntu Desktop image -- resolved versions"; \
+      echo "# name<TAB>expected version"; \
+      printf 'base-image\t%s\n'  "${BASE_IMAGE}"; \
+      printf 'ubuntu\t%s\n'      "$(. /etc/os-release; echo "${VERSION_ID}")"; \
+      printf 'kasmvnc\t%s\n'     "$(dpkg-query -W -f='${Version}' kasmvncserver)"; \
+      printf 'xkasmvnc\t%s\n'    "$(Xkasmvnc -version 2>&1 | sed -n 's/^Xvnc KasmVNC \([^ ]*\).*/\1/p' | head -1)"; \
+      printf 'xfce4-session\t%s\n' "$(dpkg-query -W -f='${Version}' xfce4-session)"; \
+      printf 'xfwm4\t%s\n'       "$(dpkg-query -W -f='${Version}' xfwm4)"; \
+      printf 'thunar\t%s\n'      "$(dpkg-query -W -f='${Version}' thunar)"; \
+      printf 'python3\t%s\n'     "$(python3 -c 'import sys; print("%d.%d.%d" % sys.version_info[:3])')"; \
+      printf 'git\t%s\n'         "$(git --version | awk '{print $3}')"; \
+    } > "${CIRRUS_DESKTOP_HOME}/versions.txt"; \
+    lib="$(ldconfig -p | awk -F'=> ' '/libnss_wrapper/ {print $2; exit}' | tr -d ' ')"; \
+    if [ -z "$lib" ] || [ ! -r "$lib" ]; then \
+        lib="$(find /usr/lib /lib -name 'libnss_wrapper.so*' -print -quit 2>/dev/null)"; \
+    fi; \
+    test -n "$lib" && test -r "$lib"; \
+    echo "$lib" > "${CIRRUS_DESKTOP_HOME}/nss_wrapper_lib"; \
+    chmod -R a+rX "${CIRRUS_DESKTOP_HOME}"
+
+# ---------------------------------------------------------------------------
+# Runtime defaults.
+#
+# These exist so the image runs standalone for local testing; in the OOD path
+# submit.yml.erb sets them. CIRRUS_DESKTOP_BASE_URL is deliberately NOT given a
+# default: "/" from an operator and "/" because nothing was computed are
+# different things, and conflating them turns a broken init container into a
+# sign-in form that posts to the OnDemand dashboard's own root.
+# ---------------------------------------------------------------------------
+ENV CIRRUS_DESKTOP_PORT=8080 \
+    CIRRUS_DESKTOP_STATE_DIR=/tmp/cirrus-desktop \
+    CIRRUS_DESKTOP_AUTH=password \
+    CIRRUS_DESKTOP_GEOMETRY=1600x900 \
+    NO_AT_BRIDGE=1
+
+# Matches the fixed containerPort/NodePort of the other CIRRUS OOD apps.
+EXPOSE 8080
+
+ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+CMD ["desktop"]
