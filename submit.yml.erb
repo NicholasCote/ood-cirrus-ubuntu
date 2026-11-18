@@ -54,7 +54,7 @@ script:
 
         CIRRUS_DESKTOP_IDLE_TIMEOUT: "<%= idle_timeout %>"
         CIRRUS_DESKTOP_IDLE_CHECK: "<%= idle_check_interval %>"
-        CIRRUS_DESKTOP_MAX_LIFETIME: "<%= max_session_hours * 36 %>"
+        CIRRUS_DESKTOP_MAX_LIFETIME: "<%= max_session_hours * 3600 %>"
         CIRRUS_DESKTOP_GEOMETRY: "1600x900"
       port: 8080
       cpu: "<%= cpus %>"
