@@ -2,6 +2,12 @@ name: Build and push Ubuntu Desktop image
 
 on:
   workflow_dispatch:
+    inputs:
+      skip_bump:
+        description: "Build and push, but do not pin the tag in submit.yml.erb"
+        required: false
+        type: boolean
+        default: false
   push:
     paths:
       - image/**
@@ -12,9 +18,16 @@ on:
 permissions:
   contents: read
 
+# Two runs at once would race to bump submit.yml.erb; queue them instead.
+concurrency:
+  group: build-ubuntu-desktop
+  cancel-in-progress: false
+
 jobs:
   build-push:
     runs-on: ubuntu-latest
+    permissions:
+      contents: write   # to commit the new tag to submit.yml.erb
     steps:
       - name: Checkout the repo
         uses: actions/checkout@v4
@@ -94,14 +107,53 @@ jobs:
           IMAGE: ${{ steps.ref.outputs.image }}
         run: docker push "$IMAGE"
 
-      # The reference is the one thing anybody wants out of a green run: nothing
-      # uses the new image until it is pinned in submit.yml.erb by hand. A job
-      # summary is one click from the run page and holds a copyable block; a log
-      # line is neither. The ::notice puts it at the top of the run page too.
+      # Pins the image just pushed, which passed the smoke test, in
+      # submit.yml.erb on main. Only for builds of main: a manual run from
+      # another branch would otherwise pin an image of unmerged code. The edit
+      # is made on top of the latest main rather than the commit this run
+      # built, so a push that landed during the build does not reject it. The
+      # paths filter above is what prevents a build loop (submit.yml.erb is
+      # not in it); [skip ci] is belt-and-braces.
+      - name: Pin the image in submit.yml.erb
+        id: bump
+        if: ${{ github.ref == 'refs/heads/main' && !inputs.skip_bump }}
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          git fetch --quiet origin main
+          git checkout --quiet -B main origin/main
+          python3 - "$IMAGE" <<'PY'
+          import pathlib, re, sys
+          ref = sys.argv[1]
+          p = pathlib.Path("submit.yml.erb")
+          s = p.read_text()
+          new, n = re.subn(r'^(\s*desktop_img\s*=\s*)".*"$',
+                           lambda m: f'{m.group(1)}"{ref}"', s, flags=re.M)
+          if n != 1:
+              sys.exit(f"expected one desktop_img assignment in submit.yml.erb, found {n}")
+          p.write_text(new)
+          PY
+          if git diff --quiet -- submit.yml.erb; then
+            echo "desktop_img is already ${IMAGE}; nothing to commit."
+            echo "pinned=unchanged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add submit.yml.erb
+          git commit --quiet -m "Pin desktop_img to ${IMAGE##*/} [skip ci]"
+          git push --quiet origin HEAD:main
+          echo "pinned=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # The reference, and whether it was pinned, are what anybody wants out of
+      # a green run. A job summary is one click from the run page and holds a
+      # copyable block; the ::notice puts it at the top of the run page too.
       - name: Summarise the pushed image
         env:
           IMAGE: ${{ steps.ref.outputs.image }}
           TAG: ${{ steps.ref.outputs.tag }}
+          PINNED: ${{ steps.bump.outputs.pinned }}
         run: |
           echo "::notice title=Image pushed::${IMAGE}"
 
@@ -120,13 +172,18 @@ jobs:
             echo "${IMAGE}"
             echo '```'
             echo
-            echo "Pin it in \`submit.yml.erb\`, in the \`desktop_img\` line near the top:"
-            echo
-            echo '```ruby'
-            echo "  desktop_img = \"${IMAGE}\""
-            echo '```'
-            echo
-            echo "Then re-run \`image/test/acceptance.sh\` against it before announcing the app."
+            case "$PINNED" in
+              unchanged) echo "\`submit.yml.erb\` already pinned this image." ;;
+              ?*)        echo "Pinned in \`submit.yml.erb\` on main by commit \`${PINNED}\`." ;;
+              *)
+                echo "**Not pinned** (not a build of main, or skip_bump was set). To use it,"
+                echo "set the \`desktop_img\` line near the top of \`submit.yml.erb\`:"
+                echo
+                echo '```ruby'
+                echo "  desktop_img = \"${IMAGE}\""
+                echo '```'
+                ;;
+            esac
             if [ -n "$digest" ]; then
               echo
               echo "Digest: \`${digest#*@}\`"

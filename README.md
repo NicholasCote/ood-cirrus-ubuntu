@@ -1118,13 +1118,20 @@ uid gets a user name, a real session's gate serves its login page, and the
 session's ssh-agent answers `ssh-add -l` with exit 1 (no identities). A failure
 fails the build and nothing is pushed.
 
-**`submit.yml.erb` pins one of those tags and must be updated by hand** to a tag
-that has been tested. Never point it at something floating.
+**After a successful push, CI pins the new tag in `submit.yml.erb` itself**: a
+`github-actions[bot]` commit, `Pin desktop_img to ubuntu-desktop:<tag> [skip ci]`,
+made on top of the latest `main`. So pull before editing locally. It only does
+this for builds of `main`. A manual run can set `skip_bump` to build and push
+without pinning. The workflow's paths filter does not include
+`submit.yml.erb`, so the bot's commit does not start another build. If `main`
+is ever branch-protected, the bot needs to be allowed to push to it.
 
-Because that step is manual, the run writes a job summary with the full
-reference, the `desktop_img = "..."` line ready to paste, the pushed digest and
-the versions recorded in the image. It is the first thing on the run page, along
-with a `::notice` annotation carrying the same reference.
+The pinned image has passed the smoke test, not `image/test/acceptance.sh`. Run
+that against it before announcing a change to users.
+
+The run writes a job summary with the full reference, whether and by which
+commit it was pinned (or the `desktop_img = "..."` line to paste when it was
+not), the pushed digest and the versions recorded in the image.
 
 Harbor's Trivy scan cannot be run from here, so "no Criticals" is unverified —
 check it after the first push. The image does `apt-get upgrade` at build time.
