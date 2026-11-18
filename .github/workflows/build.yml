@@ -51,6 +51,44 @@ jobs:
             -f image/Dockerfile \
             image
 
+      # Runs as an arbitrary uid, the way OnDemand runs the pod, and fails the
+      # build before anything is pushed.
+      - name: Smoke test
+        env:
+          IMAGE: ${{ steps.ref.outputs.image }}
+        run: |
+          set -euo pipefail
+          docker run --rm --user 54321:54321 -e HOME=/tmp/h -e USER=jdoe \
+            --entrypoint /usr/local/bin/entrypoint.sh "$IMAGE" bootstrap bash -c '
+              set -euo pipefail
+              for b in ssh ssh-agent ssh-add jq curl git bao-getkey Xkasmvnc xfce4-session cirrus-desktop-gate; do
+                command -v "$b" >/dev/null || { echo "MISSING: $b"; exit 1; }
+              done
+              echo "9fee1714bd7b149dec56798304350642167cae3eb9236aecfbc44fd39dc7bf9e  /usr/local/bin/bao-getkey" \
+                | sha256sum -c --quiet
+              [ "$(id -un)" = jdoe ] || { echo "uid has no user name"; exit 1; }
+              echo "smoke test OK"
+            '
+          # A real session: the gate must serve its login page, and the
+          # session ssh-agent must answer with no identities (exit 1, not 2).
+          # KasmVNC rejects a password shorter than 6 characters.
+          mkdir -p ood && printf 'password=smoke-test-pw\n' > ood/csenv && chmod -R a+rX ood
+          docker run -d --name smoke --user 54321:54321 -p 18080:8080 \
+            -v "$PWD/ood:/ood:ro" -e HOME=/tmp/h -e USER=jdoe \
+            -e CIRRUS_DESKTOP_PASSWORD_FILE=/ood/csenv -e CIRRUS_DESKTOP_BASE_URL=/ \
+            "$IMAGE" desktop
+          for _ in $(seq 1 60); do
+            curl -fs -o /dev/null http://127.0.0.1:18080/ && break
+            sleep 1
+          done
+          curl -fs http://127.0.0.1:18080/ | grep -q 'Session password' \
+            || { docker logs smoke; exit 1; }
+          docker exec smoke bash -c 'SSH_AUTH_SOCK=/tmp/cirrus-desktop/ssh-agent.sock ssh-add -l; [ $? = 1 ]' \
+            || { docker logs smoke; exit 1; }
+          docker stop -t 20 smoke >/dev/null
+          docker rm smoke >/dev/null
+          echo "session smoke test OK"
+
       - name: Push image to Harbor
         env:
           IMAGE: ${{ steps.ref.outputs.image }}

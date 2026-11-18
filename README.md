@@ -16,8 +16,10 @@ image/bin/entrypoint.sh     # identity, home isolation, start-up, supervision
 image/bin/cirrus-desktop-gate     # the password gate in front of KasmVNC
 image/bin/cirrus-desktop-session  # the XFCE session
 image/bin/desktop-versions        # what is actually in this image
+image/bao-getkey                  # vendored OpenBao SSH-certificate client
 image/etc/xdg/user-dirs.conf      # stops XFCE creating folders in a shared home
-image/etc/profile.d/              # the same XDG redirection for a login shell
+image/etc/profile.d/              # XDG redirection and SSH_AUTH_SOCK for a login shell
+image/etc/xdg/xfce4/xfconf/       # appearance defaults; xfce4-session's own agent off
 image/test/acceptance.sh    # the 30 checks below, runnable with podman
 .github/workflows/build.yml
 ```
@@ -27,6 +29,73 @@ image/test/acceptance.sh    # the 30 checks below, runnable with podman
 manifest rather than a misplaced one.
 
 [KasmVNC]: https://github.com/kasmtech/KasmVNC
+
+## SSH to Casper and Derecho without the two-factor prompt
+
+Open a terminal on the desktop and run `bao-getkey` once. It asks for your
+password and a Duo approval, then loads a short-lived SSH certificate into
+this session's ssh-agent:
+
+```bash
+bao-getkey
+ssh derecho.hpc.ucar.edu      # no ncar-two-factor prompt
+```
+
+Every terminal you open in the session uses the same agent, so you only do
+this once. When ssh starts prompting again, the certificate has expired: run
+`bao-getkey` again. The key is kept only in the session's memory and is never
+written to `~/.ssh`; it is gone when the session ends.
+
+The first ssh to a host asks you to confirm its host key. That is expected;
+answer `yes`.
+
+### Troubleshooting
+
+**`bao-getkey` says "error in libcrypto".** Your account does not have the
+OpenBao `ssh-client-signer` policy yet, so no certificate was issued. This is
+not a bug in the app; ask for the policy to be added to your account.
+
+**`bao-getkey` worked, but a new terminal still prompts.** Your `~/.bashrc`
+(or `~/.bash_profile`) probably starts its own `ssh-agent`, which replaces the
+session's agent in each new terminal. Start one there only when no agent is
+already set, for example:
+
+```bash
+if [ -z "$SSH_AUTH_SOCK" ]; then
+    eval "$(ssh-agent -s)" >/dev/null
+fi
+```
+
+**`ssh-add -l` says "Could not open a connection to your authentication
+agent".** Something in your shell start-up unset `SSH_AUTH_SOCK`. A login shell
+(`bash -l`) puts it back; or check `echo $SSH_AUTH_SOCK`, which should be
+`/tmp/cirrus-desktop/ssh-agent.sock`.
+
+### How it is wired (for administrators)
+
+- **`bao-getkey` is vendored** at `image/bao-getkey`, because its upstream repo
+  (`NCAR/hsg-openbao-scripts`) is internal to the NCAR org and an
+  unauthenticated build cannot fetch it. It is a verbatim copy of
+  `bin/bao-getkey` at commit `ef6b7a7503c911977865df50df3b4d4fc223c25b`
+  (sha256 `9fee1714bd7b149dec56798304350642167cae3eb9236aecfbc44fd39dc7bf9e`),
+  and CI checks the hash. To update it, copy the file again and update the hash
+  in the Dockerfile comment, the workflow and `image/test/acceptance.sh`.
+- **The entrypoint starts one ssh-agent per session**, on container-local
+  `/tmp/cirrus-desktop/ssh-agent.sock` (never the NFS home), and exports
+  `SSH_AUTH_SOCK` before `xfce4-session` starts, so every terminal inherits it.
+  It is stopped with the rest of the session.
+- **Nothing in the desktop replaces it.** xfce4-session 4.18 starts its own
+  ssh-agent unless it recognises one as already running, and looks for a
+  gpg-agent too (`/startup/ssh-agent/enabled` and `/startup/gpg-agent/enabled`
+  in the `xfce4-session` channel, both on by default). It did reuse ours in
+  testing, but only because `SSH_AGENT_PID` was exported and alive, so
+  `image/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml` turns
+  both off. That file replaces the package's, so it carries the package's
+  Failsafe session too. gnome-keyring is not installed and has no autostart
+  entry, so its ssh component cannot take over either.
+  `image/test/acceptance.sh` checks all of this in a running desktop.
+- **`/etc/profile.d/cirrus-desktop.sh`** sets `SSH_AUTH_SOCK` for a login shell
+  that lost it, and only when it is unset.
 
 ## Why KasmVNC
 
@@ -936,7 +1005,8 @@ shared home.
 
 XFCE core — session, window manager, panel, desktop, settings — plus
 xfce4-terminal, Thunar, Mousepad and xfce4-appfinder. Then `git`, `less`,
-`nano`, `curl`, `openssh-client` for the terminal, and `python3` for the gate.
+`nano`, `curl`, `jq`, `openssh-client` for the terminal (and `bao-getkey`, which
+needs the last three), and `python3` for the gate.
 Appearance: `yaru-theme-gtk`, `yaru-theme-icon`, `humanity-icon-theme`,
 `adwaita-icon-theme`, `fonts-ubuntu`, `fonts-dejavu-core`. And
 `epiphany-browser` plus `xdg-utils`, so that clicking a URL does something.
@@ -1040,6 +1110,13 @@ Triggers on `workflow_dispatch` and on pushes to `main` touching `image/**` or
 the workflow. Tags are date stamps, `%Y-%m-%d.%H.%M`, pushed to
 `hub.k8s.ucar.edu/ncote/ubuntu-desktop`, with `HARBOR_LOGIN` and `HARBOR_SECRET`
 as the credentials.
+
+Before anything is pushed, a smoke test runs the image as an arbitrary uid: the
+tools are present (`ssh`, `ssh-agent`, `ssh-add`, `jq`, `curl`, `bao-getkey`
+and the desktop's own), `bao-getkey`'s sha256 matches the vendored upstream, the
+uid gets a user name, a real session's gate serves its login page, and the
+session's ssh-agent answers `ssh-add -l` with exit 1 (no identities). A failure
+fails the build and nothing is pushed.
 
 **`submit.yml.erb` pins one of those tags and must be updated by hand** to a tag
 that has been tested. Never point it at something floating.

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  xfce4-session 4.18.3's own /etc/xdg file, unchanged, plus the "startup"
+  block. This file replaces the package's, so the Failsafe session below has to
+  stay.
+
+  The entrypoint starts the session's one ssh-agent and exports SSH_AUTH_SOCK
+  before xfce4-session runs; bao-getkey loads its certificate into that agent.
+  xfce4-session would otherwise start an agent of its own (ssh-agent by
+  default, or gpg-agent in ssh mode) whenever it does not recognise one as
+  already running, and every terminal would inherit that socket instead.
+  Both are switched off. gnome-keyring is not installed, so its ssh component
+  cannot take over either.
+-->
+
+<channel name="xfce4-session" version="1.0">
+  <property name="general" type="empty">
+    <property name="FailsafeSessionName" type="string" value="Failsafe"/>
+    <property name="LockCommand" type="string" value=""/>
+  </property>
+  <property name="sessions" type="empty">
+    <property name="Failsafe" type="empty">
+      <property name="IsFailsafe" type="bool" value="true"/>
+      <property name="Count" type="int" value="5"/>
+      <property name="Client0_Command" type="array">
+        <value type="string" value="xfwm4"/>
+      </property>
+      <property name="Client0_Priority" type="int" value="15"/>
+      <property name="Client0_PerScreen" type="bool" value="false"/>
+      <property name="Client1_Command" type="array">
+        <value type="string" value="xfsettingsd"/>
+      </property>
+      <property name="Client1_Priority" type="int" value="20"/>
+      <property name="Client1_PerScreen" type="bool" value="false"/>
+      <property name="Client2_Command" type="array">
+        <value type="string" value="xfce4-panel"/>
+      </property>
+      <property name="Client2_Priority" type="int" value="25"/>
+      <property name="Client2_PerScreen" type="bool" value="false"/>
+      <property name="Client3_Command" type="array">
+        <value type="string" value="Thunar"/>
+        <value type="string" value="--daemon"/>
+      </property>
+      <property name="Client3_Priority" type="int" value="30"/>
+      <property name="Client3_PerScreen" type="bool" value="false"/>
+      <property name="Client4_Command" type="array">
+        <value type="string" value="xfdesktop"/>
+      </property>
+      <property name="Client4_Priority" type="int" value="35"/>
+      <property name="Client4_PerScreen" type="bool" value="false"/>
+    </property>
+  </property>
+  <property name="startup" type="empty">
+    <property name="ssh-agent" type="empty">
+      <property name="enabled" type="bool" value="false"/>
+    </property>
+    <property name="gpg-agent" type="empty">
+      <property name="enabled" type="bool" value="false"/>
+    </property>
+  </property>
+</channel>

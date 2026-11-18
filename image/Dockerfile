@@ -106,9 +106,11 @@ ENV CIRRUS_DESKTOP_HOME=/opt/cirrus-desktop
 #                 is a write into the shared GLADE home.
 # xauth           Xkasmvnc writes an X authority file; without xauth the
 #                 cookie is never created and every client is refused.
-# openssh-client  xfce4-session looks for an ssh-agent at start-up and says
-#                 "No SSH authentication agent found" without one. git over
-#                 ssh from the desktop terminal is a real workflow here.
+# openssh-client  ssh, ssh-agent and ssh-add: git over ssh from the desktop
+#                 terminal, and bao-getkey (below). The entrypoint starts the
+#                 session's one ssh-agent; xfce4-session's own is switched off
+#                 in etc/xdg/.../xfce4-session.xml so it cannot replace it.
+# curl, jq        required by bao-getkey. curl is also the watchdog's client.
 # libnss-wrapper  the arbitrary-uid case. The pod runs as the user's NFS uid,
 #                 which has no passwd entry, and XFCE, the terminal prompt,
 #                 git and ssh all call getpwuid().
@@ -252,6 +254,7 @@ RUN DEBIAN_FRONTEND=noninteractive apt-get update \
         curl \
         dbus-x11 \
         git \
+        jq \
         less \
         libnss-wrapper \
         nano \
@@ -373,6 +376,19 @@ COPY --chmod=0755 bin/entrypoint.sh           /usr/local/bin/entrypoint.sh
 COPY --chmod=0755 bin/cirrus-desktop-gate     /usr/local/bin/cirrus-desktop-gate
 COPY --chmod=0755 bin/cirrus-desktop-session  /usr/local/bin/cirrus-desktop-session
 COPY --chmod=0755 bin/desktop-versions        /usr/local/bin/desktop-versions
+
+# --- bao-getkey -------------------------------------------------------------
+# HSG's OpenBao client (NCAR/hsg-openbao-scripts, MIT). One password+Duo login
+# mints a short-lived signed SSH certificate and loads it into ssh-agent, so
+# ssh to Casper/Derecho stops prompting for ncar-two-factor.
+#
+# Vendored because the upstream repo is internal to the NCAR org and an
+# unauthenticated build cannot fetch it. Verbatim copy of bin/bao-getkey at
+# commit ef6b7a7503c911977865df50df3b4d4fc223c25b, sha256
+# 9fee1714bd7b149dec56798304350642167cae3eb9236aecfbc44fd39dc7bf9e (CI checks
+# it). The entrypoint starts the ssh-agent it loads into.
+COPY bao-getkey /usr/local/bin/bao-getkey
+RUN chmod 0755 /usr/local/bin/bao-getkey
 
 # Read by any login shell inside the session. The desktop's own processes
 # inherit their environment from the entrypoint, so this is the belt-and-braces

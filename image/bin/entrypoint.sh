@@ -746,6 +746,29 @@ rm -f "$DISPFIFO"
 export DISPLAY=":${DISPNUM}"
 log "X server ready on ${DISPLAY}"
 
+# --- one ssh-agent per session ----------------------------------------------
+#
+# For bao-getkey, which loads a short-lived OpenBao SSH certificate into it so
+# ssh to Casper/Derecho skips the two-factor prompt, and for git over ssh.
+# Exported before XFCE starts, so every terminal inherits the same socket.
+# On container-local /tmp, never the NFS home: it ends with the pod and is
+# never shared between sessions. xfce4-session's own agent is switched off in
+# its xfconf defaults, and no gnome-keyring is installed, so nothing in the
+# desktop replaces this one. A missing agent is a warning, not a failure: the
+# desktop is still useful without it.
+SSH_AGENT_SOCK="${STATE_DIR}/ssh-agent.sock"
+SSH_AGENT_PID=""
+rm -f -- "$SSH_AGENT_SOCK"
+if agent_env="$(ssh-agent -s -a "$SSH_AGENT_SOCK" 2>&1)"; then
+    SSH_AGENT_PID="$(printf '%s\n' "$agent_env" | sed -n 's/^SSH_AGENT_PID=\([0-9]*\);.*/\1/p')"
+    export SSH_AUTH_SOCK="$SSH_AGENT_SOCK" SSH_AGENT_PID
+    log "ssh-agent started at ${SSH_AUTH_SOCK} (pid ${SSH_AGENT_PID:-?})"
+else
+    unset SSH_AUTH_SOCK SSH_AGENT_PID
+    warn "ssh-agent failed to start; bao-getkey will not work in this session."
+    warn "${agent_env}"
+fi
+
 # --- XFCE -----------------------------------------------------------------
 /usr/local/bin/cirrus-desktop-session &
 SESSION_PID=$!
@@ -892,7 +915,8 @@ fi
 shutdown_all() {
     local pid
     for pid in "$SESSION_PID" "$KASM_PID" ${GATE_PID:+"$GATE_PID"} \
-               ${WATCHDOG_PID:+"$WATCHDOG_PID"} "$DBUS_PID"; do
+               ${WATCHDOG_PID:+"$WATCHDOG_PID"} ${SSH_AGENT_PID:+"$SSH_AGENT_PID"} \
+               "$DBUS_PID"; do
         kill -TERM "$pid" 2>/dev/null || true
     done
 }

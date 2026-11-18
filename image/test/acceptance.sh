@@ -16,6 +16,7 @@
 #   7. the idle watchdog: no false positive while a client is attached, and an
 #      exit 0 when none is
 #   8. the versions recorded in the image
+#   9. the session's one ssh-agent, inherited by the whole desktop
 #
 # Usage: image/test/acceptance.sh [image-ref]
 set -uo pipefail
@@ -35,7 +36,9 @@ note() { printf '  note %s\n' "$*"; }
 head_() { printf '\n== %s ==\n' "$*"; }
 
 cleanup() {
-    podman rm -f "$NAME" "${NAME}-cull" "${NAME}-live" "${NAME}-nopw" >/dev/null 2>&1
+    # --ignore: without it podman 4.9 removes NOTHING when any one name is
+    # missing (-nopw is run with --rm), and still exits 0.
+    podman rm -f --ignore "$NAME" "${NAME}-cull" "${NAME}-live" "${NAME}-nopw" >/dev/null 2>&1
     # The throwaway home is written by a uid inside the container's user
     # namespace, so the host user cannot remove it directly.
     podman unshare rm -rf "$WORK" 2>/dev/null || rm -rf "$WORK" 2>/dev/null
@@ -656,7 +659,53 @@ case "$pub" in
     *)                  bad "the session's PYTHONUSERBASE is '${pub}'; --user would write to a shared dotfile" ;;
 esac
 
-head_ "13. versions recorded in the image"
+head_ "13. the session's ssh-agent"
+# One agent per session, started by the entrypoint and inherited by the whole
+# desktop. If xfce4-session (or a keyring) started its own, terminals would get
+# that one instead and a bao-getkey certificate would land somewhere else.
+SOCK=/tmp/cirrus-desktop/ssh-agent.sock
+envs=$(podman exec "$NAME" bash -c '
+    for p in xfce4-session xfce4-panel xfdesktop; do
+        pid=$(pgrep -x "$p" | head -1)
+        printf "%s=%s\n" "$p" "$(tr "\0" "\n" < /proc/$pid/environ 2>/dev/null | sed -n "s/^SSH_AUTH_SOCK=//p")"
+    done')
+wrong=$(printf '%s\n' "$envs" | grep -v "=${SOCK}\$")
+[ -z "$wrong" ] && ok "xfce4-session, xfce4-panel and xfdesktop all have SSH_AUTH_SOCK=${SOCK}" \
+                || bad "desktop processes with another SSH_AUTH_SOCK: $(echo $wrong)"
+agents=$(podman exec "$NAME" bash -c 'pgrep -x ssh-agent | wc -l; pgrep -x gpg-agent | wc -l; pgrep -f "[g]nome-keyring" | wc -l' | tr '\n' ' ')
+[ "$agents" = "1 0 0 " ] && ok "exactly one ssh-agent; no gpg-agent, no gnome-keyring" \
+                         || bad "ssh-agent/gpg-agent/gnome-keyring counts: ${agents}"
+xs=/etc/xdg/xfce4/xfconf/xfce-perchannel-xml/xfce4-session.xml
+if podman exec "$NAME" bash -c "grep -q 'name=\"Failsafe\"' $xs && [ \$(grep -c 'name=\"enabled\" type=\"bool\" value=\"false\"' $xs) = 2 ]"; then
+    ok "xfce4-session.xml keeps the Failsafe session and turns its ssh/gpg agents off"
+else
+    bad "xfce4-session.xml lost the Failsafe session or still starts an agent"
+fi
+if podman logs "$NAME" 2>&1 | grep -qiE 'GPG agent|SSH authentication agent'; then
+    bad "xfce4-session still looked for an agent: $(podman logs "$NAME" 2>&1 | grep -iE 'GPG agent|SSH authentication agent' | head -2 | tr '\n' ' ')"
+else
+    ok "xfce4-session did not look for or start an agent"
+fi
+rc=$(podman exec "$NAME" bash -c "SSH_AUTH_SOCK=${SOCK} ssh-add -l >/dev/null 2>&1; echo \$?")
+[ "$rc" = 1 ] && ok "ssh-add -l against the session agent: exit 1, no identities yet" \
+              || bad "ssh-add -l exit ${rc} (2 means the agent is unreachable)"
+rc=$(podman exec "$NAME" bash -c "env -u SSH_AUTH_SOCK bash -lc 'echo \$SSH_AUTH_SOCK'")
+[ "$rc" = "$SOCK" ] && ok "a login shell that lost SSH_AUTH_SOCK gets it back from profile.d" \
+                    || bad "profile.d fallback gave '${rc}'"
+rc=$(podman exec "$NAME" bash -c "SSH_AUTH_SOCK=/tmp/mine bash -lc 'echo \$SSH_AUTH_SOCK'")
+[ "$rc" = /tmp/mine ] && ok "profile.d leaves a SSH_AUTH_SOCK that is already set alone" \
+                      || bad "profile.d replaced an existing SSH_AUTH_SOCK with '${rc}'"
+missing=""
+for b in ssh ssh-agent ssh-add jq curl bao-getkey; do
+    podman exec "$NAME" sh -c "command -v $b" >/dev/null 2>&1 || missing="$missing $b"
+done
+[ -z "$missing" ] && ok "ssh, ssh-agent, ssh-add, jq, curl and bao-getkey are installed" \
+                  || bad "missing from the image:${missing}"
+podman exec "$NAME" sh -c 'echo "9fee1714bd7b149dec56798304350642167cae3eb9236aecfbc44fd39dc7bf9e  /usr/local/bin/bao-getkey" | sha256sum -c --quiet' >/dev/null 2>&1 \
+    && ok "bao-getkey is the vendored upstream ef6b7a7 (sha256 matches)" \
+    || bad "bao-getkey sha256 does not match the vendored upstream"
+
+head_ "14. versions recorded in the image"
 podman run --rm -e CIRRUS_DESKTOP_AUTH=none "$IMAGE" bootstrap desktop-versions 2>/dev/null \
     | grep -v '^#' | sed 's/^/  /'
 if podman run --rm -e CIRRUS_DESKTOP_AUTH=none "$IMAGE" bootstrap desktop-versions --check >/dev/null 2>&1; then

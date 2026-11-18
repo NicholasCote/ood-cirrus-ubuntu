@@ -26,3 +26,11 @@ if [ -n "${CIRRUS_DESKTOP_PERSIST_DIR:-}" ] && [ -d "${CIRRUS_DESKTOP_PERSIST_DI
     : "${PYTHONUSERBASE:=${CIRRUS_DESKTOP_PERSIST_DIR}/python}"
     export XDG_CONFIG_HOME XDG_DATA_HOME PYTHONUSERBASE
 fi
+
+# The session's ssh-agent, for bao-getkey and ssh to Casper/Derecho. Every
+# desktop process inherits SSH_AUTH_SOCK from the entrypoint; this is a fallback
+# for a shell that lost it. Only when unset, so a user's own agent is left alone.
+if [ -z "${SSH_AUTH_SOCK:-}" ] && [ -S "${CIRRUS_DESKTOP_STATE_DIR:-/tmp/cirrus-desktop}/ssh-agent.sock" ]; then
+    SSH_AUTH_SOCK="${CIRRUS_DESKTOP_STATE_DIR:-/tmp/cirrus-desktop}/ssh-agent.sock"
+    export SSH_AUTH_SOCK
+fi
